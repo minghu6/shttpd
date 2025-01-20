@@ -158,6 +158,7 @@ pub enum ECN {
     CE
 }
 
+/// Datagram (header + data) length
 #[derive(Clone, Copy, PartialEq, Eq, Hash, FromBytes, ToBytes)]
 #[derive_to_bits(u16)]
 #[repr(transparent)]
@@ -603,7 +604,7 @@ pub struct PseudoHeader {
     pub dst: IPv4Addr,
     pub zeros: u8,
     pub proto: Protocol,
-    /// The length of the payload (such as length of UDP header and data).
+    /// The length of the payload (such as length of TCP/UDP header and data).
     pub payload_len: u16
 }
 
@@ -679,7 +680,7 @@ impl AddAssign<FragFlag> for FlagsAndOff {
 }
 
 impl TotLen {
-    /// Datagram package (Header + Data) length in bytes
+    /// Datagram (header + data) length in bytes
     pub fn tot_len(&self) -> usize {
         self.0 as usize * 4
     }

@@ -5,7 +5,17 @@ edition = "2024"
 description = ""
 authors = [ "minghu6 <a19678zy@163.com>" ]
 
+[features]
+default = ["parse"]
+parse = []
+full = ["parse"]
+
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+# http
+cookie = "0.18"
+mime = "0.3"
+http = "1.0"
+
 m6tobytes = { path = "../m6coll/m6tobytes" }
