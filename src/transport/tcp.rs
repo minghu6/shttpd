@@ -229,14 +229,9 @@ impl<'a> From<&'a [u8]> for TCPOptsSlice<'a> {
 mod parsing {
     use std::{error::Error, fmt::{Debug, Display}};
 
-    use super::*;
+    use m6parsing::Span;
 
-    #[derive(Debug, Clone, Copy)]
-    struct Span {
-        start: usize,
-        /// exclusive
-        end: usize,
-    }
+    use super::*;
 
     enum ParseTCPOptsErrorReason {
         UncompletedOption {
