@@ -9,20 +9,20 @@ authors = [ "minghu6 <a19678zy@163.com>" ]
 default = ["full"]
 # default = ["parse"]
 parse = ["dep:m6parsing"]
-http = ["dep:cookie", "dep:mime", "dep:http"]
+http = ["dep:cookie", "dep:mime", "dep:url"]
 full = ["parse", "http"]
 
 [dependencies]
 m6tobytes = { path = "../m6coll/m6tobytes" }
 derive_more = { version = "1.0.0", features = ["display", "error"] }
+strum = { version = "0.27", features = ["derive"] }
 
 # optional http
 cookie = { version = "0.18", optional = true }
 mime = { version = "0.3", optional = true }
-http = { version = "1.0", optional = true }
+url = { version = "2.5.4", optional = true }
 
 # optional parse
 m6parsing = { path = "../m6coll/m6parsing", optional = true }
-
 
 [dev-dependencies]

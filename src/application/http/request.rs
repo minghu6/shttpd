@@ -6,17 +6,17 @@ use super::Parameters;
 ////////////////////////////////////////////////////////////////////////////////
 //// Structures
 
-#[repr(transparent)]
-pub struct Accept {
-    items: Box<[MediaRangeAndWeight]>
-}
+// #[repr(transparent)]
+// pub struct Accept {
+//     items: Box<[MediaRangeAndWeight]>
+// }
 
 
-pub struct MediaRangeAndWeight {
-    media_range: Mime,
-    params: Parameters,
-    weight: f32,
-}
+// pub struct MediaRangeAndWeight {
+//     media_range: Mime,
+//     params: Parameters,
+//     weight: f32,
+// }
 
 pub struct Cookie {
     // 'static lifetimes doen't means there are static storage in binary file.

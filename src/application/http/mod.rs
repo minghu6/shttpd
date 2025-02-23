@@ -1,7 +1,14 @@
-use std::{borrow::Cow, collections::HashMap};
+use std::{
+    borrow::Cow, collections::HashMap, mem::transmute, str::FromStr,
+    string::ToString,
+};
 
+use m6parsing::Span;
+use m6tobytes::derive_to_bits;
 #[cfg(feature = "parse")]
 pub use parsing::*;
+use strum::{Display, EnumString};
+use url::Url;
 
 pub mod request;
 pub mod response;
@@ -10,10 +17,303 @@ pub mod response;
 ////////////////////////////////////////////////////////////////////////////////
 //// Structures
 
-pub struct Parameters {
-    inner: HashMap<Cow<'static, str>, Cow<'static, str>>,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Message<'a> {
+    Request(Request<'a>),
+    Response(Response<'a>),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Request<'a> {
+    method: Method,
+    target: RequestTarget,
+    version: Version,
+    // fields: Fields<'static>,
+    body: &'a [u8],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Response<'a> {
+    version: Version,
+    status: StatusCode,
+    reason: Option<Box<str>>,
+    // fields: Fields<'static>,
+    body: &'a [u8],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, EnumString, Display)]
+pub enum Method {
+    Options,
+    Get,
+    Post,
+    Put,
+    Delete,
+    Head,
+    Trace,
+    Connect,
+    Patch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum RequestTarget {
+    /// absolute path ['?' query]
+    Origin {
+        path: Box<str>,
+        query: Option<Box<str>>,
+    },
+    /// absolute uri
+    Absolute {
+        uri: Url,
+    },
+    Authority {
+        host: Box<str>,
+        port: u16,
+    },
+    Asterisk,
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, EnumString,
+)]
+#[non_exhaustive]
+pub enum Version {
+    #[strum(serialize = "HTTP/0.9")]
+    HTTP09,
+    #[strum(serialize = "HTTP/1.0")]
+    HTTP10,
+    #[strum(serialize = "HTTP/1.1")]
+    HTTP11,
+    #[strum(serialize = "HTTP/2")]
+    H2,
+    #[strum(serialize = "HTTP/3")]
+    H3,
+}
+
+/// Refer [RFC-9110#status-codes]
+/// (https://datatracker.ietf.org/doc/html/rfc9110#name-status-codes)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive_to_bits(u16)]
+#[repr(u16)]
+pub enum StatusCode {
+    /// response to client test if the request (maybe large)
+    /// could pass to server.
+    Continue = 100,
+    SwitchingProtocols = 101,
+
+    Ok = 200,
+    Created = 201,
+    Accepted = 202,
+    NonAuthoriativeInfo = 203,
+    /// success response witout extra content
+    NonContent = 204,
+    /// reset content view like refresh
+    ResetContent = 205,
+    PartialContent = 206,
+
+    MultipleChoices = 300,
+    MovePermanently = 301,
+    Found = 302,
+    SeeOther = 303,
+    NotModified = 304,
+    /// Deprecated use proxy
+    Deprecated305 = 305,
+    Deprecated306 = 306,
+    TemporaryRedirect = 307,
+    PermanentRedirect = 308,
+
+    BadRequest = 400,
+    Unauthoriozed = 401,
+    PaymentRequired = 402,
+    Forbidden = 403,
+    NotFound = 404,
+    MethodNotAllowed = 405,
+    /// there is no acceptable resource for user agent
+    ///
+    /// it should contains a list of available representation
+    NotAcceptable = 406,
+    ProxyAuthenticationRequired = 407,
+    RequestTimeout = 408,
+    /// this code is used in situations where the user might be able to
+    /// resolve the conflict and resubmit the request.
+    /// the server should generate content that includes enough information
+    /// for a user to recognize the source of the conflic
+    Conflict = 409,
+    /// resource is no longer available permanently,
+    /// if no facilities to know if it's permanent it should use 404/
+    Gone = 410,
+    /// require `Content-Lenght` field
+    LengthRequired = 411,
+    PreconditionFailed = 412,
+    ContentTooLarge = 413,
+    URITooLong = 414,
+    UnsupportedMediaType = 415,
+    RangeNotSatisfiable = 416,
+    /// require `Expect` field
+    ExpectationFailed = 417,
+    April1Unused = 418,
+    MisdirectedRequest = 421,
+    /// content syntax is ok, but instructions is erroneous (semantics error)
+    UnprocessableContent = 422,
+    UpgradeRequired = 426,
+
+    InternalServerError = 500,
+    NotImplemented = 501,
+    BadGateway = 502,
+    ServiceUnavailable = 503,
+    GatewayTimeout = 504,
+    HTTPVersionNotSupported = 505,
+}
+
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fields<'a> {
+    value: HashMap<FieldName, Field<'a>>,
+}
+
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, EnumString, Display,
+)]
+pub enum FieldName {
+    #[strum(serialize = "Content-Type")]
+    ContentType,
+    #[strum(serialize = "{0}", default)]
+    NonSandard(Box<str>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Field<'a> {
+    NonSandard(RawField<'a>),
+}
+
+// derive trait `Ord` based on
+// [lexicographic order](https://doc.rust-lang.org/std/cmp/trait.Ord.html#derivable)
+// which is name here.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RawField<'a> {
+    pub name: Cow<'a, str>,
+    pub value: Box<[Cow<'a, [u8]>]>,
+}
+
+///
+/// xx=yy ; mm=nn ...
+///
+/// ```abnf
+/// parameters      = *( OWS ";" OWS [ parameter ] )
+/// parameter       = parameter-name "=" parameter-value
+/// parameter-name  = token
+/// parameter-value = ( token / quoted-string )
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Parameters<'a> {
+    value: HashMap<&'a str, Vec<ParameterValue<'a>>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParameterValue<'a> {
+    Token(&'a str),
+    QStr(Cow<'a, [u8]>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SingletonFieldValue<'a> {
+    Token(Cow<'a, str>),
+    QStr(Cow<'a, [u8]>),
+    Oth(Cow<'a, [u8]>),
+}
+
+pub struct MediaType {
+
+}
+
+////////////////////////////////////////////////////////////////////////////////
+//// Implementations
+
+// impl Field {
+//     pub fn name(&self) -> &str {
+//         match self {
+//             Self::NonSandard(raw) => &raw.name,
+//         }
+//     }
+// }
+
+
+impl<'a> Fields<'a> {
+    // pub fn push(&mut self, field: Field) {
+    //     match self.value.binary_search_by_key(&field.name(), |f| f.name()) {
+    //         Ok(_idx) => unimplemented!(),
+    //         Err(idx) => self.value.insert(idx, field),
+    //     }
+    // }
+}
+
+impl<'a> Parameters<'a> {}
+
+
+impl TryFrom<u16> for StatusCode {
+    type Error = Box<str>;
+
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        match value {
+            100..=101
+            | 200..=206
+            | 300..=308
+            | 400..=418
+            | 421..=422
+            | 426
+            | 500..=505 => Ok(unsafe { transmute(value) }),
+            _ => {
+                Err(format!("Unknown status code {}", value).into_boxed_str())
+            }
+        }
+    }
+}
+
+impl FromStr for StatusCode {
+    type Err = Box<str>;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        s.parse::<u16>()
+            .map_err(|err| err.to_string().into_boxed_str())
+            .and_then(|uint| uint.try_into())
+    }
+}
+
+impl FromStr for RequestTarget {
+    type Err = Box<str>;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s == "*" {
+            return Ok(Self::Asterisk);
+        }
+
+        let url =
+            Url::parse(s).map_err(|err| err.to_string().into_boxed_str())?;
+
+        Ok(if let Some(host) = url.host_str() {
+            if let Some(port) = url.port()
+                && url.path() == "/"
+            {
+                Self::Authority {
+                    host: host.to_string().into_boxed_str(),
+                    port,
+                }
+            }
+            else {
+                Self::Absolute { uri: url }
+            }
+        }
+        else {
+            Self::Origin {
+                path: url.path().to_owned().into_boxed_str(),
+                query: url.query().map(|q| q.to_owned().into_boxed_str()),
+            }
+        })
+    }
+}
+
+
+////////////////////////////////////////////////////////////////////////////////
+//// Embedded Mods
 
 ///
 /// Refer:
@@ -27,568 +327,1023 @@ pub struct Parameters {
 #[cfg(feature = "parse")]
 mod parsing {
 
-    use std::{borrow::Cow, ops::AddAssign};
+    use std::{
+        borrow::Cow,
+        collections::{HashMap, hash_map::Entry},
+        convert::Infallible,
+        error::Error,
+        ops::Deref,
+        str::{FromStr, from_utf8_unchecked},
+    };
 
     use ParseErrorReason::*;
-    use TokenizeErrorReason::*;
-    use m6parsing::*;
-    use m6tobytes::{derive_from_bits, derive_to_bits};
+    use derive_more::derive::Display;
+    use m6parsing::Span;
 
-    macro_rules! define_token_type {
-        ($($name:ident),* $(,)?) => {
-            $(
-                pub struct $name;
+    use super::*;
 
-                impl Peek for $name {
-                    type TokenType = TokenType;
 
-                    fn token_type() -> Self::TokenType {
-                        TokenType::$name
-                    }
-                }
-            )*
+    macro_rules! ALPHA {
+        () => {
+            b'a'..=b'z' | b'A'..=b'Z'
         };
     }
 
-    pub struct ParseConfig {
-        skip_invalid_char: bool,
-        quote_anychar: bool,
+    macro_rules! DIGIT {
+        () => {
+            b'0'..=b'9'
+        };
     }
 
+    /// obs-text, obsoleted chars, viewed as opaque data
+    macro_rules! OBS_TEXT {
+        () => {
+            0x80..=0xFF
+        };
+    }
+
+    /// VCHAR exclude delimiters
+    macro_rules! TCHAR {
+        () => {
+            b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' |
+            b'+' | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~' |
+            DIGIT![] | ALPHA![]
+        };
+    }
+
+    /// `"(),/:;<=>?@[\]{}"`
+    macro_rules! DELIMITERS_EX_PAREN {
+        () => {
+            // b'(' | b')'
+            b',' | b'/'
+                | b':'
+                | b';'
+                | b'<'
+                | b'='
+                | b'>'
+                | b'?'
+                | b'@'
+                | b'['
+                | b']'
+                | b'\\'
+                | b'{'
+                | b'}'
+        };
+    }
+
+    macro_rules! WS {
+        () => {
+            SP | HTAB
+        };
+    }
+
+    /// visable ascii char
+    macro_rules! VCHAR {
+        () => {
+            0x21..=0x7E
+        };
+    }
+
+    pub const STANDARD: ParseOptions = ParseOptions {
+        // skip_invalid_char: false,
+        // quote_anychar: true,
+        // strict_space: true,
+    };
+
+    const HTAB: u8 = 0x09;
+    const SP: u8 = 0x20;
+    // 13
+    const CR: u8 = b'\n';
+    // 10
+    const LF: u8 = b'\r';
+    const DQUOTE: u8 = b'"';
+    const CRLF: &[u8] = b"\n\r";
+    const LPAREN: u8 = b'(';
+    const RPAREN: u8 = b')';
+    const BACKSLASH: u8 = b'\\';
+
+
+    pub struct ParseOptions {
+        // skip_invalid_char: bool,
+        // quote_anychar: bool,
+        // strict_space: bool,
+        // allow_empty_field_value: bool
+    }
+
+    #[derive(Debug, Display)]
+    #[display("{self:?}")]
     pub struct ParseError {
-        pub reason: ParseErrorReason,
-        pub span: Span,
+        reason: ParseErrorReason,
+        span: Span,
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, Display)]
     pub enum ParseErrorReason {
-        Expect {
-            expect: Box<str>,
-            found: Box<str>,
-            for_: Box<str>,
-        },
-        TokenizeFailed {
-            reason: TokenizeErrorReason,
-        },
-    }
-
-    pub struct TokenizeError {
-        pub reason: TokenizeErrorReason,
-        pub span: Span,
-    }
-
-    #[derive(Debug)]
-    pub enum TokenizeErrorReason {
-        UnpairedString,
-        InvalidChar(u8),
-        /// `\r` without following`\n`
-        UncoupledLF,
+        LackCRLF,
         /// `\n` without followed by `\r`
         UncoupledCR,
-        InvalidCharInStr(u8),
-        InvalidQuotedChar(u8),
-        DisableMultiLine,
-        UnfinishedToken(TokenType),
+        InvalidStartLine,
+        InvalidFieldLine(FieldName),
     }
 
-    #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-    #[derive_to_bits(u8)]
-    #[derive_from_bits(u8)]
-    #[repr(u8)]
-    pub enum TokenType {
-        Text = 1,
-        WS,
-        Str,
-        Comment,
-        LParen,
-        RParen,
-        Comma,
-        Slash,
-        Colon,
-        Semicolon,
-        Lt,
-        Eq,
-        Gt,
-        Question,
-        At,
-        LBracket,
-        RBracket,
-        BackSlash,
-        LBrace,
-        RBrace,
-        CRLF,
+    enum StartLine {
+        RequestLine {
+            method: Method,
+            target: RequestTarget,
+            version: Version,
+        },
+        StatusLine {
+            version: Version,
+            status: StatusCode,
+            reason: Option<Box<str>>,
+        },
     }
 
-    #[derive(Debug)]
-    pub struct Token {
-        pub ty: TokenType,
-        pub val: Box<[u8]>,
-        pub span: Span,
+    struct MaybeBoxedStr {
+        value: Option<Box<str>>,
     }
 
-    define_token_type! {
-        Text,
-        WS,
-        Str,
-        Comment,
-        LParen,
-        RParen,
-        Comma,
-        Slash,
-        Colon,
-        Semicolon,
-        Lt,
-        Eq,
-        Gt,
-        Question,
-        At,
-        LBracket,
-        RBracket,
-        BackSlash,
-        LBrace,
-        RBrace,
-        CRLF,
+    // enum FieldValue<'a> {
+    //     Singleton(Cow<'a, [u8]>),
+    //     List(Vec<Member<'a>>)
+    // }
+
+    // pub enum Member<'a> {
+    //     Parameters(Parameters<'a>),
+    //     Singleton(SingletonFieldValue<'a>),
+    // }
+
+    type RawFields<'a> = HashMap<&'a str, Vec<RawFieldValue<'a>>>;
+
+    struct RawFieldValue<'a> {
+        value: Cow<'a, [u8]>,
+        span: Span,
     }
 
-    impl m6parsing::Token for Token {
-        type TokenType = TokenType;
+    enum CowBuf<'a> {
+        Slice {
+            value: &'a [u8],
+            start: usize,
+            end: usize,
+        },
+        Owned {
+            value: Vec<u8>,
+        },
+    }
 
-        fn token_type(&self) -> Self::TokenType {
-            self.ty
+    impl<'a> CowBuf<'a> {
+        fn init(value: &'a [u8]) -> Self {
+            Self::Slice {
+                value,
+                start: 0,
+                end: 0,
+            }
         }
-    }
 
-    impl Default for ParseConfig {
-        fn default() -> Self {
-            Self {
-                skip_invalid_char: true,
-                quote_anychar: true,
+        fn to_cow_slice(self) -> Cow<'a, [u8]> {
+            match self {
+                Self::Slice { value, start, end } => {
+                    Cow::Borrowed(&value[start..end])
+                }
+                Self::Owned { value } => Cow::Owned(value),
+            }
+        }
+
+        fn start(&mut self, i: usize) {
+            let Self::Slice { start, end, .. } = self
+            else {
+                unreachable!()
+            };
+
+            *start = i;
+            *end = i;
+        }
+
+        fn push(&mut self, b: u8) {
+            match self {
+                Self::Slice { end, .. } => *end += 1,
+                Self::Owned { value } => value.push(b),
+            }
+        }
+
+        fn clone_push(&mut self, b: u8) {
+            match *self {
+                Self::Slice { value, start, end } => {
+                    let mut owned = value[start..end].to_owned();
+                    owned.push(b);
+                    *self = Self::Owned { value: owned }
+                }
+                Self::Owned { ref mut value } => {
+                    value.push(b);
+                }
             }
         }
     }
 
-    impl ParseConfig {
-        fn tokenize(
+    impl<'a> Deref for RawFieldValue<'a> {
+        type Target = Cow<'a, [u8]>;
+
+        fn deref(&self) -> &Self::Target {
+            &self.value
+        }
+    }
+
+    impl Error for ParseError {}
+
+    impl FromStr for MaybeBoxedStr {
+        type Err = Infallible;
+
+        fn from_str(s: &str) -> Result<Self, Self::Err> {
+            Ok(Self {
+                value: if s.is_empty() {
+                    Some(s.to_owned().into_boxed_str())
+                }
+                else {
+                    None
+                },
+            })
+        }
+    }
+
+    impl ParseOptions {
+        pub fn parse<'a>(
             &self,
-            bytes: &[u8],
-        ) -> Result<Box<[Token]>, TokenizeError> {
-            use std::ops::Add;
+            bytes: &'a [u8],
+        ) -> Result<Message<'a>, ParseError> {
+            /* parse startline */
 
+            let (startline, offset_startline) = self.parse_startline(bytes)?;
+
+            /* parse fields */
+
+            let (raw_fields, offset_fields) = self
+                .parse_raw_fields(&bytes[offset_startline..])
+                .map_err(|mut err| {
+                    err.span >>= offset_startline;
+                    err
+                })?;
+
+            let body = &bytes[offset_startline + offset_fields..];
+
+            Ok(match startline {
+                StartLine::RequestLine {
+                    method,
+                    target,
+                    version,
+                } => Message::Request(Request {
+                    method,
+                    target,
+                    version,
+                    // fields,
+                    body,
+                }),
+                StartLine::StatusLine {
+                    version,
+                    status,
+                    reason,
+                } => Message::Response(Response {
+                    version,
+                    status,
+                    reason,
+                    // fields,
+                    body,
+                }),
+            })
+        }
+
+        ///
+        /// first byte is double-quote
+        ///
+        /// return (parsed-bytes (exclude double quote), offset)
+        ///
+        fn parse_qstr<'a>(
+            &self,
+            bytes: &'a [u8],
+        ) -> Result<(Cow<'a, [u8]>, usize), usize> {
             use State::*;
-            use TokenType::*;
 
-            macro_rules! ALPHA {
-                () => {
-                    b'a'..=b'z' | b'A'..=b'Z'
+            let mut state = Start;
+            let mut buf = CowBuf::init(bytes);
+
+            #[derive(Clone, Copy)]
+            enum State {
+                Start,
+                InStr,
+                OutStr,
+                Quoting,
+            }
+
+            let mut i = 0;
+
+            while i < bytes.len() {
+                let b = bytes[i];
+
+                state = match (state, b) {
+                    (Start, DQUOTE) => {
+                        buf.start(i + 1);
+
+                        InStr
+                    }
+                    (
+                        InStr,
+                        WS![] | 0x21 | 0x23..=0x5b | 0x5d..=0x7e | OBS_TEXT![],
+                    ) => {
+                        buf.push(b);
+
+                        state
+                    }
+                    (InStr, BACKSLASH) => Quoting,
+                    (Quoting, WS![] | VCHAR![] | OBS_TEXT![]) => {
+                        buf.clone_push(b);
+
+                        InStr
+                    }
+                    (InStr, DQUOTE) => OutStr,
+                    _ => break,
+                };
+
+                i += 1;
+            }
+
+            match state {
+                OutStr => Ok((buf.to_cow_slice(), i)),
+                _ => Err(i + 1),
+            }
+        }
+
+        /// return (str, offset)
+        fn consume_token<'a>(&self, bytes: &'a [u8]) -> (&'a str, usize) {
+            let mut i = 0;
+
+            while i < bytes.len() {
+                match bytes[i] {
+                    TCHAR![] => (),
+                    _ => break,
+                }
+
+                i += 1;
+            }
+
+            (unsafe { from_utf8_unchecked(&bytes[..i]) }, i)
+        }
+
+        fn parse_parameters<'a>(
+            &self,
+            bytes: &'a [u8],
+        ) -> Result<Parameters<'a>, Span> {
+            use State::*;
+
+            use super::ParameterValue::*;
+
+            macro_rules! throw {
+                ($range:expr) => {
+                    Err(Span::from($range))?
                 };
             }
 
-            macro_rules! DIGIT {
-                () => {
-                    b'0'..=b'9'
+            #[derive(Clone, Copy)]
+            enum State {
+                Start,
+                InPreOWS,
+                InPostOWS,
+            }
+
+            let mut raw_parameters: HashMap<&'a str, Vec<ParameterValue<'a>>> =
+                HashMap::new();
+
+            let mut i = 0;
+            let mut state = Start;
+
+            while i < bytes.len() {
+                state = match (state, bytes[i]) {
+                    (Start, WS![]) => {
+                        i += 1;
+
+                        InPreOWS
+                    },
+                    (Start | InPreOWS, b';') => {
+                        i += 1;
+
+                        InPostOWS
+                    },
+                    (InPreOWS | InPostOWS, WS![]) => {
+                        i += 1;
+
+                        state
+                    },
+                    (InPostOWS, TCHAR![]) => {
+                        let (param_name, offset) =
+                            self.consume_token(&bytes[i..]);
+                        i += offset;
+
+                        if i == bytes.len() {
+                            throw!(..bytes.len())
+                        }
+
+                        let (param_value, offset) = if bytes[i] == DQUOTE {
+                            let (qstr, offset) = self
+                                .parse_qstr(&bytes[i..])
+                                .map_err(|offset| Span::from(i..i + offset))?;
+
+                            (QStr(qstr), offset)
+                        }
+                        else {
+                            let (token, offset) =
+                                self.consume_token(&bytes[i..]);
+
+                            (Token(token), offset)
+                        };
+                        i += offset;
+
+                        match raw_parameters.entry(param_name) {
+                            Entry::Occupied(mut occupied) => {
+                                occupied.get_mut().push(param_value);
+                            }
+                            Entry::Vacant(vacant) => {
+                                vacant.insert(vec![param_value]);
+                            }
+                        }
+
+                        InPreOWS
+                    }
+                    _ => throw!(..=i),
                 };
             }
 
-            /// obs-text, opaque data
-            macro_rules! OBS_TEXT {
-                () => {
-                    0x80..=0xFF
+            Ok(Parameters {
+                value: raw_parameters,
+            })
+        }
+
+        fn transmute_field_value_as_singleton<'a>(
+            &self,
+            value: &'a RawFieldValue<'a>,
+        ) -> SingletonFieldValue<'a> {
+            use QuotingEnv::*;
+            use SingletonFieldValue::*;
+            use State::*;
+
+            let mut state = Start;
+            let mut buf = CowBuf::init(value);
+
+            #[derive(Clone, Copy)]
+            enum State {
+                Start,
+                InToken,
+                InComment(usize),
+                InStr,
+                OutStr,
+                Quoting(QuotingEnv),
+                Unknown,
+            }
+
+            #[derive(Clone, Copy)]
+            enum QuotingEnv {
+                Comment(usize),
+                Str,
+            }
+
+            for (i, b) in value.iter().cloned().enumerate() {
+                state = match (state, b) {
+                    (Start, TCHAR![]) => {
+                        buf.start(i);
+
+                        InToken
+                    }
+                    (Start, DQUOTE) => {
+                        buf.start(i + 1);
+
+                        InStr
+                    }
+                    (Start, LPAREN) => InComment(1),
+                    (InToken, TCHAR![]) => {
+                        buf.push(b);
+
+                        state
+                    }
+                    (
+                        InStr,
+                        WS![] | 0x21 | 0x23..=0x5b | 0x5d..=0x7e | OBS_TEXT![],
+                    ) => {
+                        buf.push(b);
+
+                        state
+                    }
+                    (
+                        InComment(..),
+                        WS![]
+                        | 0x21..=0x27
+                        | 0x2A..=0x5B
+                        | 0x5D..=0x7E
+                        | OBS_TEXT![],
+                    ) => state,
+                    (InStr | InComment(..), BACKSLASH) => {
+                        Quoting(match state {
+                            InStr => Str,
+                            InComment(cnt) => Comment(cnt),
+                            _ => unreachable!(),
+                        })
+                    }
+                    (Quoting(env), WS![] | VCHAR![] | OBS_TEXT![]) => {
+                        match env {
+                            Str => {
+                                buf.clone_push(b);
+
+                                InStr
+                            }
+                            Comment(cnt) => InComment(cnt),
+                        }
+                    }
+                    (InStr, DQUOTE) => OutStr,
+                    (InComment(cnt), RPAREN) => {
+                        if cnt > 0 {
+                            InComment(cnt - 1)
+                        }
+                        else {
+                            Start
+                        }
+                    }
+                    _ => Unknown,
+                }
+            }
+
+            match state {
+                InToken => Token({
+                    match buf.to_cow_slice() {
+                        Cow::Borrowed(borrowed) => Cow::Borrowed(unsafe {
+                            from_utf8_unchecked(borrowed)
+                        }),
+                        Cow::Owned(owned) => Cow::Owned(unsafe {
+                            String::from_utf8_unchecked(owned)
+                        }),
+                    }
+                }),
+                OutStr => QStr(buf.to_cow_slice()),
+                _ => Oth(Cow::Borrowed(value)),
+            }
+        }
+
+        // pub fn transmute_field_value_as_list<'a>(
+        //     &self,
+        //     value: &'a [RawFieldValue<'a>],
+        // ) -> Box<[Member<'a>]> {
+
+        //     let mut members = Vec::with_capacity(value.len());
+
+        //     for raw_field_value in value {
+        //         let mut i = 0;
+
+        //         /* try parse token */
+        //         while i < raw_field_value.len() {
+        //             match raw_field_value[i] {
+        //                 TCHAR![] => (),
+        //                 b'=' => {
+        //                     // parse parameters
+        //                 },
+        //                 b';' => {
+        //                     // parse parameter
+        //                 }
+        //             }
+        //         }
+        //     }
+
+        //     members.into_boxed_slice()
+        // }
+
+        fn parse_raw_fields<'a>(
+            &self,
+            bytes: &'a [u8],
+        ) -> Result<(RawFields<'a>, usize), ParseError> {
+            let mut i = 0;
+
+            macro_rules! throw {
+                ($range:expr) => {
+                    Err(error!($range))?
                 };
             }
 
-            macro_rules! TCHAR {
-                () => {
-                    b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' |
-                    b'+' | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~' |
-                    DIGIT![] | ALPHA![] |
-                    OBS_TEXT![]
-                };
-            }
-
-            /// `"(),/:;<=>?@[\]{}"`
-            macro_rules! DELIMITERS_EX_PAREN {
-                () => {
-                    // b'(' | b')'
-                    b',' | b'/'
-                        | b':'
-                        | b';'
-                        | b'<'
-                        | b'='
-                        | b'>'
-                        | b'?'
-                        | b'@'
-                        | b'['
-                        | b']'
-                        | b'\\'
-                        | b'{'
-                        | b'}'
-                };
-            }
-
-            macro_rules! WS {
-                () => {
-                    SP | HTAB
-                };
-            }
-
-            /// `0..=8 | 10..=31 | 127`
-            macro_rules! INVALID_CHARS {
-                () => {
-                    0..=8 | 11..13 | 14..=31 | 127
-                };
-            }
-
-            /// visable ascii char
-            macro_rules! VCHAR {
-                () => {
-                    0x21..=0x7E
-                };
-            }
-
-            macro_rules! VALID_QUOTED_CHAR {
-                () => {
-                    WS![] | VCHAR![] | OBS_TEXT![]
-                };
-            }
-
-            macro_rules! CTEXT {
-                () => {
-                    HTAB | SP | 0x21..=0x27 | 0x2A..=0x5B | 0x5D..=0x7E | OBS_TEXT![]
-                };
-            }
-
-            macro_rules! delimiter2type {
-                ($byte:expr) => {
-                    match $byte {
-                        b'(' => TokenType::LParen,
-                        b')' => TokenType::RParen,
-                        b',' => TokenType::Comma,
-                        b'/' => TokenType::Slash,
-                        b':' => TokenType::Colon,
-                        b';' => TokenType::Semicolon,
-                        b'<' => TokenType::Lt,
-                        b'=' => TokenType::Eq,
-                        b'>' => TokenType::Gt,
-                        b'?' => TokenType::Question,
-                        b'@' => TokenType::At,
-                        b'[' => TokenType::LBracket,
-                        b']' => TokenType::RBracket,
-                        b'{' => TokenType::LBrace,
-                        b'}' => TokenType::RBrace,
-                        _ => unreachable!(),
+            macro_rules! error {
+                ($range:expr) => {
+                    ParseError {
+                        reason: InvalidStartLine,
+                        span: ($range).into(),
                     }
                 };
             }
 
             macro_rules! consume {
-                (@delimiters $byte:expr) => {
-                    (InDelimiter(delimiter2type!($byte)), PUSH)
+                ($contpat:pat, $endpat:pat $(,$throw:ident)?) => {{
+                    let mut j = i;
+
+                    loop {
+                        if j == bytes.len() {
+                            throw!(j..j+1)
+                        }
+
+                        match bytes[j] {
+                            $contpat => (),
+                            $endpat => break,
+                            $( _ => $throw!(j..j + 1))?
+                        }
+
+                        j += 1;
+                    }
+
+                    let value = &bytes[i..j];
+                    #[allow(unused)]
+                    i = j;
+                    value
+                }};
+            }
+
+            macro_rules! FIELD_VCHAR {
+                () => {
+                    WS![] | VCHAR![] | OBS_TEXT![]
                 };
-                (@delimiters($ty:expr) $byte:expr) => {
-                    (InDelimiter(delimiter2type!($byte)), PUSH + $ty)
+            }
+
+            let mut fields: RawFields = HashMap::new();
+
+            'finish: loop {
+                /* parse field name */
+
+                let field_name = unsafe {
+                    from_utf8_unchecked(consume!(TCHAR![], b':', throw))
                 };
-                (@uncoupled_lf($i:ident, $state:ident) $byte:expr) => {{
-                    if !self.skip_invalid_char {
-                        Err(TokenizeError {
-                            reason: UncoupledLF,
-                            span: ($i..$i + 1).into(),
-                        })?
+
+                /* consume `:` */
+
+                i += 1;
+
+                /* consume option white spaces */
+
+                consume!(WS![], _);
+
+                /* parse field value */
+
+                let field_value_start = i;
+
+                let mut field_value =
+                    Cow::Borrowed(consume!(FIELD_VCHAR![], CR, throw));
+
+                /* consume option white spaces */
+
+                /* consume CRLF */
+
+                consume!(CR, LF, throw);
+
+                i += 1;
+
+                'nextline: loop {
+                    if i == bytes.len() {
+                        throw!(i..bytes.len())
                     }
 
-                    ($state, NOP)
-                }};
-                (@uncoupled_cr($i:ident, $state:ident) $byte:expr) => {{
-                    if !self.skip_invalid_char {
-                        Err(TokenizeError {
-                            reason: UncoupledCR,
-                            span: ($i..$i + 1).into(),
-                        })?
-                    }
+                    match bytes[i] {
+                        // obsolete line folding (replace CRLF with SP)
+                        SP => {
+                            if field_value.is_borrowed() {
+                                field_value =
+                                    Cow::Owned(field_value.into_owned());
+                            }
 
-                    ($state, NOP)
-                }};
-                (@invalidchars($i:ident, $state:ident) $byte:expr) => {{
-                    if !self.skip_invalid_char {
-                        Err(TokenizeError {
-                            reason: InvalidChar($byte),
-                            span: ($i..$i + 1).into(),
-                        })?
-                    }
+                            consume!(WS![], _);
 
-                    ($state, NOP)
-                }};
-                (@disable_multiline($i:ident, $state:ident) $byte:expr) => {{
-                    Err(TokenizeError {
-                        reason: DisableMultiLine,
-                        span: ($i..$i + 1).into(),
-                    })?
-                }};
-            }
+                            field_value.to_mut().push(SP);
+                            field_value.to_mut().extend(consume!(
+                                FIELD_VCHAR![],
+                                CR,
+                                throw
+                            ));
 
-            const HTAB: u8 = 0x09;
-            const SP: u8 = 0x20;
-            // 13
-            const CR: u8 = b'\n';
-            // 10
-            const LF: u8 = b'\r';
-            const DQUOTE: u8 = b'"';
+                            consume!(CR, LF, throw);
+                        }
+                        #[allow(unreachable_patterns)]
+                        CR | FIELD_VCHAR![] => {
+                            /* push field */
 
-            const NOP: StackAction = StackAction(0);
-            const PUSH: StackAction = StackAction(1);
+                            let field_value_end = i;
 
-            #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-            enum State {
-                Empty,
-                InTChar,
-                // nested comment
-                InComment(u32),
-                InDelimiter(TokenType),
-                InCR,
-                InCRLF,
-                InWS,
-                InStr,
-                // such as \a
-                // prev state
-                InQuoting(QuotingEnv),
-            }
+                            let field_value = RawFieldValue {
+                                value: field_value,
+                                span: (field_value_start..field_value_end)
+                                    .into(),
+                            };
 
-            #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-            enum QuotingEnv {
-                InStr,
-                InComment(u32),
-            }
+                            match fields.entry(&field_name) {
+                                Entry::Occupied(mut occupied) => {
+                                    occupied.get_mut().push(field_value);
+                                }
+                                Entry::Vacant(vacant) => {
+                                    vacant.insert(vec![field_value]);
+                                }
+                            }
 
-            /// Buffer Operation
-            ///
-            /// ```no_main
-            /// 0b0000_0000
-            ///
-            /// ```
-            ///
-            #[derive(Clone, Copy, PartialEq, Eq)]
-            struct StackAction(u16);
-
-
-            impl Into<State> for QuotingEnv {
-                fn into(self) -> State {
-                    match self {
-                        Self::InStr => InStr,
-                        Self::InComment(cnt) => InComment(cnt),
+                            if bytes[i] == CR {
+                                consume!(CR, LF, throw);
+                                break 'finish;
+                            }
+                            else {
+                                break 'nextline;
+                            }
+                        }
+                        _ => throw!(i..i + 1),
                     }
                 }
             }
 
-            impl Add<TokenType> for StackAction {
-                type Output = Self;
+            Ok((fields, i))
+        }
 
-                fn add(self, rhs: TokenType) -> Self::Output {
-                    Self((rhs.to_bits() as u16) << 8 | (self.0 & 0x00FF))
-                }
+        fn lift_fields<'a>(
+            &self,
+            raw_fields: RawFields<'a>,
+        ) -> Result<Fields, ParseError> {
+            let mut fields = HashMap::new();
+
+            for (name, value) in raw_fields.into_iter() {}
+
+            Ok(Fields { value: fields })
+        }
+
+        fn parse_startline(
+            &self,
+            bytes: &[u8],
+        ) -> Result<(StartLine, usize), ParseError> {
+            let mut i = 0;
+
+            macro_rules! throw {
+                ($range:expr) => {
+                    Err(error!($range))?
+                };
             }
 
-            impl AddAssign<TokenType> for StackAction {
-                fn add_assign(&mut self, rhs: TokenType) {
-                    *self = self.add(rhs);
-                }
+            macro_rules! error {
+                ($range:expr) => {
+                    ParseError {
+                        reason: InvalidStartLine,
+                        span: ($range).into(),
+                    }
+                };
             }
 
-            impl StackAction {
-                fn part0(&self) -> Self {
-                    Self(self.0 & 0x00FF)
-                }
+            macro_rules! consume {
+                (s=$name:literal) => {
+                    {
+                        let name = $name;
+                        consume!(s=name);
+                    }
+                };
+                (s=$name:ident) => {
+                    let offset = $name.len();
 
-                fn part1(&self) -> Option<TokenType> {
-                    let bits = (self.0 >> 8) as u8;
+                    if bytes.len() < i + offset {
+                        throw!(i..bytes.len())
+                    }
 
-                    if bits > 0 {
-                        Some(unsafe { TokenType::from_u8(bits) })
+                    if &bytes[i..i + offset] == $name {
+                        i += offset;
                     }
                     else {
-                        None
+                        throw!(i..i + offset)
                     }
-                }
-            }
-
-            fn eval_action(
-                action: StackAction,
-                byte: u8,
-                i: usize,
-                buf: &mut Vec<u8>,
-                tokens: &mut Vec<Token>,
-            ) {
-                if PUSH == action.part0() {
-                    buf.push(byte);
-                }
-
-                if let Some(token_type) = action.part1() {
-                    tokens.push(Token {
-                        ty: token_type,
-                        val: buf.clone().into_boxed_slice(),
-                        span: (i - buf.len()..i).into(),
-                    });
-
-                    buf.clear();
-                }
-            }
-
-            let mut state = Empty;
-
-            let mut tokens = Vec::new();
-            let mut buf = Vec::new();
-
-
-            for (i, byte) in bytes.iter().cloned().enumerate() {
-                let (next_state, action) = match state {
-                    Empty | InDelimiter(..) | InCRLF | InTChar | InWS => {
-                        let (next_state, mut next_action) = match byte {
-                            TCHAR![] => (InTChar, PUSH),
-                            b'(' => (InComment(1), PUSH),
-                            DELIMITERS_EX_PAREN![] => {
-                                consume!(@delimiters byte)
-                            }
-                            WS![] => (InWS, PUSH),
-                            DQUOTE => (InStr, PUSH),
-                            CR => (InCR, PUSH),
-                            LF => consume!(
-                                @uncoupled_lf(i, state) byte
-                            ),
-                            b')' | INVALID_CHARS![] => consume!(
-                                @invalidchars(i, state) byte
-                            ),
-                        };
-
-                        match state {
-                            InTChar => {
-                                if next_state != state {
-                                    next_action += Text;
-                                }
-                            }
-                            InWS => {
-                                if next_state != state {
-                                    next_action += WS;
-                                }
-                            }
-                            InDelimiter(ty) => {
-                                next_action += ty;
-                            }
-                            InCRLF => {
-                                next_action += CRLF;
-                            }
-                            _ => unreachable!(),
-                        }
-
-                        (next_state, next_action)
-                    }
-                    InCR => match byte {
-                        LF => (InCRLF, PUSH + CRLF),
-                        _ => consume!(
-                            @uncoupled_cr(i, state) byte
-                        ),
-                    },
-                    InStr => match byte {
-                        b'\\' => (InQuoting(QuotingEnv::InStr), NOP),
-                        b'"' => (Empty, PUSH + Str),
-                        CR | LF => consume!(
-                            @disable_multiline(i, state) byte
-                        ),
-                        _ => (state, PUSH),
-                    },
-                    InComment(cnt) => match byte {
-                        b')' => {
-                            if cnt == 0 {
-                                (Empty, PUSH + Comment)
-                            }
-                            else {
-                                (InComment(cnt - 1), PUSH)
-                            }
-                        }
-                        b'(' => (InComment(cnt + 1), PUSH),
-                        b'\\' => (InQuoting(QuotingEnv::InComment(cnt)), NOP),
-                        CTEXT![] => (state, PUSH),
-                        CR | LF => consume!(
-                            @disable_multiline(i, state) byte
-                        ),
-                        _ => consume!(
-                                @invalidchars(i, state) byte
-                        ),
-                    },
-                    InQuoting(env) => match byte {
-                        VALID_QUOTED_CHAR![] => (env.into(), PUSH),
-                        _ => {
-                            if self.quote_anychar {
-                                (env.into(), PUSH)
-                            }
-                            else {
-                                Err(TokenizeError {
-                                    reason: InvalidQuotedChar(byte),
-                                    span: (i..i + 1).into(),
-                                })?
-                            }
-                        }
-                    },
                 };
-
-                eval_action(action, byte, i, &mut buf, &mut tokens);
-
-                state = next_state;
-            }
-
-            /* collect tail token */
-
-            let collect_result = match state {
-                Empty => Ok(NOP),
-                InTChar => Ok(NOP + Text),
-                InComment(..) => Err(UnfinishedToken(Comment)),
-                InDelimiter(ty) => Ok(NOP + ty),
-                InWS => Ok(NOP + WS),
-                InCR => Err(UnfinishedToken(CRLF)),
-                InCRLF => Ok(NOP + CRLF),
-                InStr => Err(UnfinishedToken(Str)),
-                InQuoting(env) => Err(UnfinishedToken(match env {
-                    QuotingEnv::InStr => Str,
-                    QuotingEnv::InComment(..) => Comment,
-                })),
-            };
-
-            match collect_result {
-                Ok(action) => {
-                    eval_action(action, 0, bytes.len(), &mut buf, &mut tokens)
+                ({
+                    s=$name:literal => $e:path
+                    $(,s=$namex:literal => $ex:path)*
                 }
-                Err(reason) => Err(TokenizeError {
-                    reason,
-                    span: (bytes.len() - buf.len()..buf.len()).into(),
-                })?,
+                ) =>
+                {{
+                    let offset = $name.len();
+
+                    if bytes.len() < i + offset {
+                        throw!(i..bytes.len())
+                    }
+
+                    if &bytes[i..i + offset] == $name {
+                        i += offset;
+                        $e
+                    }
+                    $(else if &bytes[i..i + offset] == $namex {
+                        i += offset;
+                        $ex
+                    })*
+                    else {
+                        throw!(i..bytes.len())
+                    }
+                }};
+                (c=$char:ident) => {
+                    let offset = 1;
+
+                    if bytes.len() < i + offset {
+                        throw!(i..bytes.len())
+                    }
+
+                    if bytes[i + offset] == $char {
+                        i += offset;
+                    }
+                    else {
+                        throw!(i..i + offset)
+                    }
+                };
+                (@$e:ident $offset:expr) => {{
+                    let offset = $offset;
+
+                    if bytes.len() < i + offset {
+                        throw!(i..bytes.len())
+                    }
+
+                    let raw = std::str::from_utf8(&bytes[i..i + offset])
+                        .map_err(|_| error!(i..i + offset))?;
+
+                    #[allow(unused)]
+                    i += offset;
+
+                    raw.parse::<$e>().map_err(|_| error!(i..i + offset))?
+                }};
             }
 
-            Ok(tokens.into_boxed_slice())
+            macro_rules! offset {
+                (=$c:literal) => {{
+                    let c = $c;
+                    offset!(=c $reason)
+                }};
+                (=$c:ident) => {{
+                    let Some(offset) =
+                        bytes[i..].iter().position(|b| *b == $c)
+                    else {
+                        throw!(i..bytes.len())
+                    };
+
+                    offset
+                }};
+            }
+
+            enum State {
+                Start,
+                H,
+                P,
+                Request { method: Method },
+                Response { version: Version },
+                Finish(StartLine),
+            }
+
+            use State::*;
+
+            let mut state = Start;
+
+            while i < bytes.len() {
+                state = match (state, bytes[i]) {
+                    // status line (response)
+                    (Start, b'H') => H,
+                    (Start, b'O') => {
+                        consume!(s = b"Options");
+
+                        Request {
+                            method: Method::Options,
+                        }
+                    }
+                    (Start, b'G') => {
+                        consume!(s = b"Get");
+
+                        Request {
+                            method: Method::Get,
+                        }
+                    }
+                    (Start, b'P') => {
+                        i += 1;
+
+                        P
+                    }
+                    (Start, b'D') => {
+                        consume!(s = b"Delete");
+
+                        Request {
+                            method: Method::Delete,
+                        }
+                    }
+                    (H, b'T') => {
+                        /* parse status line */
+
+                        consume!(s = b"TTP/");
+
+                        let version = consume!(
+                            {
+                                s=b"0.9" => Version::HTTP09,
+                                s=b"1.0" => Version::HTTP10,
+                                s=b"1.1" => Version::HTTP11
+                            }
+                        );
+
+                        Response { version }
+                    }
+                    (H, b'e') => {
+                        consume!(s = b"ead");
+
+                        Request {
+                            method: Method::Head,
+                        }
+                    }
+                    (P, b'o') => {
+                        consume!(s = b"ost");
+
+                        Request {
+                            method: Method::Post,
+                        }
+                    }
+                    (P, b'u') => {
+                        consume!(s = b"ut");
+
+                        Request {
+                            method: Method::Put,
+                        }
+                    }
+                    (P, b'a') => {
+                        consume!(s = b"atch");
+
+                        Request {
+                            method: Method::Patch,
+                        }
+                    }
+                    /* It may allow more lenient parsing that
+                    such whitespace includes one or more of the following octets:
+                    SP, HTAB, VT (%x0B), FF (%x0C), or bare CR
+                    (however it's not recommend) */
+                    (Request { method }, SP) => {
+                        consume!(c = SP);
+
+                        let target = consume!(@RequestTarget offset!(=SP));
+
+                        consume!(c = SP);
+
+                        let version = consume!(@Version 8);
+
+                        Finish(StartLine::RequestLine {
+                            method,
+                            target,
+                            version,
+                        })
+                    }
+                    (Response { version }, SP) => {
+                        consume!(c = SP);
+
+                        let status = consume!(@StatusCode 3);
+
+                        consume!(c = SP);
+
+                        let reason =
+                            consume!(@MaybeBoxedStr offset!(=CR)).value;
+
+                        Finish(StartLine::StatusLine {
+                            version,
+                            status,
+                            reason,
+                        })
+                    }
+                    (Finish(startline), ..) => {
+                        consume!(s = CRLF);
+
+                        return Ok((startline, i));
+                    }
+                    _ => throw!(i..i + 1),
+                }
+            }
+
+            throw!(i..bytes.len())
         }
+    }
 
-        fn parse1(
-            &self,
-            tokens: Box<[Token]>,
-        ) -> Result<Box<[(Cow<str>, Vec<Cow<str>>)]>, ParseError> {
-            let mut res = Vec::new();
-
-
-            Ok(res.into_boxed_slice())
-        }
-
-        pub fn parse(&self, bytes: &[u8]) -> Result<(), ParseError> {
-            let tokens = self.tokenize(bytes).map_err(|err| ParseError {
-                reason: TokenizeFailed { reason: err.reason },
-                span: err.span,
-            })?;
-
-            self.parse1(tokens)?;
-
-            Ok(())
+    impl<'a> Message<'a> {
+        pub fn parse(bytes: &'a [u8]) -> Result<Self, ParseError> {
+            STANDARD.parse(bytes)
         }
     }
 }
 
 
+#[cfg(test)]
+mod tests {
 
-////////////////////////////////////////////////////////////////////////////////
-//// Implementations
+    use super::*;
 
-impl Parameters {}
+    #[test]
+    fn verify_strnum_usage() {
+        assert_eq!(
+            FieldName::ContentType.to_string(),
+            "Content-Type".to_owned()
+        );
+        assert_eq!(
+            "Content-Type".parse::<FieldName>().unwrap(),
+            FieldName::ContentType
+        );
+        assert_eq!(
+            "ABC".to_owned(),
+            FieldName::NonSandard("ABC".to_owned().into_boxed_str())
+                .to_string()
+        );
+        assert_eq!(
+            "ABC".parse::<FieldName>().unwrap(),
+            FieldName::NonSandard("ABC".to_owned().into_boxed_str())
+        );
+    }
+}

@@ -313,10 +313,7 @@ mod parsing {
                             expect: $expect,
                             opt: $opt,
                         },
-                        span: Span {
-                            start: ptr,
-                            end: self.0.len(),
-                        },
+                        span: (ptr..self.0.len()).into()
                     }
                 };
             }
@@ -329,10 +326,7 @@ mod parsing {
                             found: $found,
                             opt: $opt,
                         },
-                        span: Span {
-                            start: ptr + 1,
-                            end: ptr + 2,
-                        },
+                        span: (ptr+1..ptr+2).into()
                     }
                 };
             }
