@@ -1,0 +1,24 @@
+[package]
+name = "shttpd"
+version = "0.1.0"
+edition = "2024"
+description = ""
+authors = [ "minghu6 <a19678zy@163.com>" ]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+clap = { version = "^3", features = ["derive"] }
+clap_complete = "3.1.1"
+shellexpand = "2.1"
+
+osimodel = { path = "../osimodel", features = ["http"]}
+
+# http
+cookie = "0.18"
+
+
+[[bin]]
+name="shttpd"
+path="bin/shttpd"
+
