@@ -235,6 +235,10 @@ name = "m6parsing"
 version = "0.1.0"
 
 [[package]]
+name = "m6ptr"
+version = "0.1.0"
+
+[[package]]
 name = "m6syn"
 version = "0.1.0"
 dependencies = [
@@ -249,12 +253,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mime"
-version = "0.3.17"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
-
-[[package]]
 name = "num-conv"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -267,8 +265,8 @@ dependencies = [
  "cookie",
  "derive_more",
  "m6parsing",
+ "m6ptr",
  "m6tobytes",
- "mime",
  "strum",
  "url",
 ]

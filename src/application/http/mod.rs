@@ -1,46 +1,55 @@
 use std::{
-    borrow::Cow, collections::HashMap, mem::transmute, str::FromStr,
+    collections::HashMap, mem::transmute, num::ParseIntError, str::FromStr,
     string::ToString,
 };
 
-use m6parsing::Span;
+use m6ptr::FlatCow;
 use m6tobytes::derive_to_bits;
-#[cfg(feature = "parse")]
 pub use parsing::*;
 use strum::{Display, EnumString};
 use url::Url;
 
+use super::{charset, mime};
+
+pub mod parsing;
 pub mod request;
 pub mod response;
 
+////////////////////////////////////////////////////////////////////////////////
+//// Constants
+
+const SP: char = 0x20 as char;
+const COMMA: char = ',' as char;
+const HYPHEN: char = '-' as char;
 
 ////////////////////////////////////////////////////////////////////////////////
 //// Structures
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum Message<'a> {
     Request(Request<'a>),
     Response(Response<'a>),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Request<'a> {
-    method: Method,
-    target: RequestTarget,
-    version: Version,
-    // fields: Fields<'static>,
-    body: &'a [u8],
+    pub method: Method,
+    pub target: RequestTarget,
+    pub version: Version,
+    pub fields: Fields<'a>,
+    pub body: &'a [u8],
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Response<'a> {
-    version: Version,
-    status: StatusCode,
-    reason: Option<Box<str>>,
-    // fields: Fields<'static>,
-    body: &'a [u8],
+    pub version: Version,
+    pub status: StatusCode,
+    pub reason: Option<Box<str>>,
+    pub fields: Fields<'a>,
+    pub body: &'a [u8],
 }
 
+/// case-sensitive
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, EnumString, Display)]
 pub enum Method {
     Options,
@@ -72,8 +81,18 @@ pub enum RequestTarget {
     Asterisk,
 }
 
+/// case-sensitive
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, EnumString,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    EnumString,
+    Display,
 )]
 #[non_exhaustive]
 pub enum Version {
@@ -165,33 +184,38 @@ pub enum StatusCode {
 }
 
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Fields<'a> {
-    value: HashMap<FieldName, Field<'a>>,
+    pub fields: HashMap<FieldName, Field<'a>>,
 }
 
 #[derive(
     Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, EnumString, Display,
 )]
 pub enum FieldName {
-    #[strum(serialize = "Content-Type")]
+    #[strum(serialize = "Content-Type", ascii_case_insensitive)]
     ContentType,
+    #[strum(serialize = "Accept", ascii_case_insensitive)]
+    Accept,
     #[strum(serialize = "{0}", default)]
     NonSandard(Box<str>),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone)]
 pub enum Field<'a> {
+    ContentType(MediaType<'a>),
+    Accept(Accept<'a>),
     NonSandard(RawField<'a>),
 }
 
-// derive trait `Ord` based on
-// [lexicographic order](https://doc.rust-lang.org/std/cmp/trait.Ord.html#derivable)
-// which is name here.
+/// derive trait `Ord` based on
+/// [lexicographic order]
+/// (https://doc.rust-lang.org/std/cmp/trait.Ord.html#derivable)
+/// which is name here.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RawField<'a> {
-    pub name: Cow<'a, str>,
-    pub value: Box<[Cow<'a, [u8]>]>,
+    pub name: &'a str,
+    pub value: Box<[FlatCow<'a, [u8]>]>,
 }
 
 ///
@@ -205,28 +229,333 @@ pub struct RawField<'a> {
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Parameters<'a> {
-    value: HashMap<&'a str, Vec<ParameterValue<'a>>>,
+    value: HashMap<FlatCow<'a, str>, Vec<ParameterValue<'a>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParameterValue<'a> {
-    Token(&'a str),
-    QStr(Cow<'a, [u8]>),
+    Token(FlatCow<'a, str>),
+    QStr(FlatCow<'a, [u8]>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SingletonFieldValue<'a> {
-    Token(Cow<'a, str>),
-    QStr(Cow<'a, [u8]>),
-    Oth(Cow<'a, [u8]>),
+    Token(FlatCow<'a, str>),
+    QStr(FlatCow<'a, [u8]>),
+    Oth(FlatCow<'a, [u8]>),
 }
 
-pub struct MediaType {
-
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaType<'a> {
+    mime: mime::MediaType,
+    parameters: Parameters<'a>,
 }
+
+#[derive(Debug, Clone)]
+pub struct MediaRange<'a> {
+    pub mime: mime::MediaRangeType,
+    pub parameters: Parameters<'a>,
+}
+
+///
+/// [Accept](https://datatracker.ietf.org/doc/html/rfc9110#name-accept)
+///
+/// Senders using weights SHOULD send "q" last (after all media-range parameters).
+/// Recipients SHOULD process any parameter named "q" as weight,
+/// regardless of parameter ordering.
+///
+/// Note: Use of the "q" parameter name to control content negotiation would interfere with
+/// any media type parameter having the same name. Hence,
+/// the media type registry disallows parameters named "q".
+///
+#[derive(Debug, Clone)]
+pub struct Accept<'a> {
+    pub values: Vec<(MediaRange<'a>, f32)>,
+}
+
+/// deprecated field (for utf-8 has become nearly ubiquitous)
+pub struct AcceptCharset {
+    pub values: Vec<(Charset, f32)>,
+}
+
+pub enum Charset {
+    Spec(charset::Charset),
+    Star,
+}
+
+pub struct ContentType<'a> {
+    pub value: MediaType<'a>,
+}
+
+pub struct ContentLength {
+    pub value: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContentEncoding {
+    value: ContentCoding,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContentCoding {
+    GZip,
+    Deflate,
+    Compress,
+    /// no encoding
+    Identity,
+}
+
+///
+/// [HTTP-date](https://datatracker.ietf.org/doc/html/rfc9110#name-date-time-formats)
+///
+/// HTTP-date    = IMF-fixdate / obs-date
+///
+/// An example of the preferred format is
+///
+/// `Sun, 06 Nov 1994 08:49:37 GMT    ; IMF-fixdate`
+///
+/// Examples of the two obsolete formats are
+///
+/// `Sunday, 06-Nov-94 08:49:37 GMT   ; obsolete RFC 850 format`
+///
+/// `Sun Nov  6 08:49:37 1994         ; ANSI C's asctime() format`
+///
+///
+/// `chrono::TimeZone::with_ymd_and_hms`
+///
+pub struct Date {
+    pub day_name: DayName,
+    pub month: MonthName,
+    pub day: u8,
+    pub year: u8,
+    pub time_of_day: TimeOfDay,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, EnumString, Display)]
+#[repr(u8)]
+pub enum DayName {
+    Mon = 1,
+    Tue,
+    Wed,
+    Thu,
+    Fri,
+    Sat,
+    Sun,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, EnumString, Display)]
+#[repr(u8)]
+pub enum MonthName {
+    Jan = 1,
+    Feb,
+    Mar,
+    Apr,
+    May,
+    Jun,
+    Jul,
+    Aug,
+    Sep,
+    Oct,
+    Nov,
+    Dec,
+}
+
+#[repr(transparent)]
+pub struct Day(u8);
+
+#[repr(transparent)]
+pub struct Month(u8);
+
+#[repr(transparent)]
+pub struct Year(u8);
+
+///
+/// time-of-day  = hour ":" minute ":" second
+///
+/// ; 00:00:00 - 23:59:60 (leap second)
+///
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TimeOfDay {
+    hour: u8,
+    minute: u8,
+    second: u8,
+}
+
 
 ////////////////////////////////////////////////////////////////////////////////
 //// Implementations
+
+impl FromStr for Date {
+    type Err = ();
+
+    fn from_str(mut s: &str) -> Result<Self, Self::Err> {
+        macro_rules! or_else {
+            ($e:expr) => {
+                $e.map_err(|_| ())?
+            };
+        }
+
+        macro_rules! require {
+            ($r:expr, $c:ident) => {
+                if s[$r] == $c.to_string() {
+                    Err(())?
+                }
+            };
+            ($r:expr, =$s:literal) => {
+                if &s[$r] == $s {
+                    Err(())?
+                }
+            };
+        }
+
+        let Some(day_name_pos) = s.find(&[SP, COMMA])
+        else {
+            Err(())?
+        };
+
+        let day_name = or_else!(s[..day_name_pos].parse::<DayName>());
+
+        let s_rem_len = s[day_name_pos + 1..].len();
+
+        if &s[day_name_pos..day_name_pos + 1] == "," {
+            // IMF-fixdate or obsolete RFC 850 format
+            if s_rem_len == 1 + 2 + 1 + 3 + 1 + 4 + 1 + 8 + 1 + 3 {
+                s = &s[day_name_pos + 1..];
+
+                require!(..1, SP);
+
+                let day = or_else!(s[1..3].parse::<u8>());
+
+                require!(3..4, SP);
+
+                let month = or_else!(s[4..7].parse::<MonthName>());
+
+                require!(7..8, SP);
+
+                let year = or_else!(s[8..12].parse::<u8>());
+
+                require!(12..13, SP);
+
+                let time_of_day = or_else!(s[13..21].parse::<TimeOfDay>());
+
+                require!(21..22, SP);
+
+                require!(22..25, ="GMT");
+
+                Ok(Self {
+                    day_name,
+                    month,
+                    day,
+                    year,
+                    time_of_day,
+                })
+            }
+            // obsolete RFC 850 format
+            else if s_rem_len == 1 + 2 + 1 + 3 + 1 + 2 + 1 + 8 + 1 + 3 {
+                s = &s[day_name_pos + 1..];
+
+                require!(..1, SP);
+
+                let day = or_else!(s[1..3].parse::<u8>());
+
+                require!(3..4, HYPHEN);
+
+                let month = or_else!(s[4..7].parse::<MonthName>());
+
+                require!(7..8, HYPHEN);
+
+                let year = or_else!(s[8..10].parse::<u8>());
+
+                require!(10..12, SP);
+
+                let time_of_day = or_else!(s[12..20].parse::<TimeOfDay>());
+
+                require!(20..21, SP);
+
+                require!(21..24, ="GMT");
+
+                Ok(Self {
+                    day_name,
+                    month,
+                    day,
+                    year,
+                    time_of_day,
+                })
+            }
+            else {
+                Err(())
+            }
+        }
+        else {
+            if s_rem_len != 3 + 1 + 2 + 1 + 8 + 1 + 4 {
+                Err(())?;
+            }
+
+            // ANSI C's asctime() format
+            s = &s[day_name_pos + 1..];
+
+            let month = or_else!(s[..3].parse::<MonthName>());
+
+            require!(3..4, SP);
+
+            let day = or_else!(s[4..6].trim_start().parse::<u8>());
+
+            require!(6..7, SP);
+
+            let time_of_day = or_else!(s[7..15].parse::<TimeOfDay>());
+
+            require!(15..16, SP);
+
+            let year = or_else!(s[16..20].parse::<u8>());
+
+            Ok(Self {
+                day_name,
+                month,
+                day,
+                year,
+                time_of_day,
+            })
+        }
+    }
+}
+
+impl FromStr for Day {
+    type Err = ParseIntError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(s.parse::<u8>()?))
+    }
+}
+
+impl FromStr for TimeOfDay {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.len() != 8 {
+            Err(())?
+        }
+
+        let hour = s[0..2].parse().map_err(|_| ())?;
+
+        if &s[2..3] != ":" {
+            Err(())?
+        }
+
+        let minute = s[3..5].parse().map_err(|_| ())?;
+
+        if &s[5..6] != ":" {
+            Err(())?
+        }
+
+        let second = s[6..8].parse().map_err(|_| ())?;
+
+        Ok(TimeOfDay {
+            hour,
+            minute,
+            second,
+        })
+    }
+}
 
 // impl Field {
 //     pub fn name(&self) -> &str {
@@ -235,7 +564,6 @@ pub struct MediaType {
 //         }
 //     }
 // }
-
 
 impl<'a> Fields<'a> {
     // pub fn push(&mut self, field: Field) {
@@ -312,1014 +640,6 @@ impl FromStr for RequestTarget {
 }
 
 
-////////////////////////////////////////////////////////////////////////////////
-//// Embedded Mods
-
-///
-/// Refer:
-///
-/// 1. [RFC-5234 - Augmented BNF for Syntax Specifications: ABNF](https://datatracker.ietf.org/doc/html/rfc5234)
-///
-/// 1. [RFC-9110 - HTTP Semantics](https://datatracker.ietf.org/doc/html/rfc9110)
-///
-/// 1. [RFC-9112 - HTTP/1.1](https://datatracker.ietf.org/doc/html/rfc9112)
-///
-#[cfg(feature = "parse")]
-mod parsing {
-
-    use std::{
-        borrow::Cow,
-        collections::{HashMap, hash_map::Entry},
-        convert::Infallible,
-        error::Error,
-        ops::Deref,
-        str::{FromStr, from_utf8_unchecked},
-    };
-
-    use ParseErrorReason::*;
-    use derive_more::derive::Display;
-    use m6parsing::Span;
-
-    use super::*;
-
-
-    macro_rules! ALPHA {
-        () => {
-            b'a'..=b'z' | b'A'..=b'Z'
-        };
-    }
-
-    macro_rules! DIGIT {
-        () => {
-            b'0'..=b'9'
-        };
-    }
-
-    /// obs-text, obsoleted chars, viewed as opaque data
-    macro_rules! OBS_TEXT {
-        () => {
-            0x80..=0xFF
-        };
-    }
-
-    /// VCHAR exclude delimiters
-    macro_rules! TCHAR {
-        () => {
-            b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' |
-            b'+' | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~' |
-            DIGIT![] | ALPHA![]
-        };
-    }
-
-    /// `"(),/:;<=>?@[\]{}"`
-    macro_rules! DELIMITERS_EX_PAREN {
-        () => {
-            // b'(' | b')'
-            b',' | b'/'
-                | b':'
-                | b';'
-                | b'<'
-                | b'='
-                | b'>'
-                | b'?'
-                | b'@'
-                | b'['
-                | b']'
-                | b'\\'
-                | b'{'
-                | b'}'
-        };
-    }
-
-    macro_rules! WS {
-        () => {
-            SP | HTAB
-        };
-    }
-
-    /// visable ascii char
-    macro_rules! VCHAR {
-        () => {
-            0x21..=0x7E
-        };
-    }
-
-    pub const STANDARD: ParseOptions = ParseOptions {
-        // skip_invalid_char: false,
-        // quote_anychar: true,
-        // strict_space: true,
-    };
-
-    const HTAB: u8 = 0x09;
-    const SP: u8 = 0x20;
-    // 13
-    const CR: u8 = b'\n';
-    // 10
-    const LF: u8 = b'\r';
-    const DQUOTE: u8 = b'"';
-    const CRLF: &[u8] = b"\n\r";
-    const LPAREN: u8 = b'(';
-    const RPAREN: u8 = b')';
-    const BACKSLASH: u8 = b'\\';
-
-
-    pub struct ParseOptions {
-        // skip_invalid_char: bool,
-        // quote_anychar: bool,
-        // strict_space: bool,
-        // allow_empty_field_value: bool
-    }
-
-    #[derive(Debug, Display)]
-    #[display("{self:?}")]
-    pub struct ParseError {
-        reason: ParseErrorReason,
-        span: Span,
-    }
-
-    #[derive(Debug, Display)]
-    pub enum ParseErrorReason {
-        LackCRLF,
-        /// `\n` without followed by `\r`
-        UncoupledCR,
-        InvalidStartLine,
-        InvalidFieldLine(FieldName),
-    }
-
-    enum StartLine {
-        RequestLine {
-            method: Method,
-            target: RequestTarget,
-            version: Version,
-        },
-        StatusLine {
-            version: Version,
-            status: StatusCode,
-            reason: Option<Box<str>>,
-        },
-    }
-
-    struct MaybeBoxedStr {
-        value: Option<Box<str>>,
-    }
-
-    // enum FieldValue<'a> {
-    //     Singleton(Cow<'a, [u8]>),
-    //     List(Vec<Member<'a>>)
-    // }
-
-    // pub enum Member<'a> {
-    //     Parameters(Parameters<'a>),
-    //     Singleton(SingletonFieldValue<'a>),
-    // }
-
-    type RawFields<'a> = HashMap<&'a str, Vec<RawFieldValue<'a>>>;
-
-    struct RawFieldValue<'a> {
-        value: Cow<'a, [u8]>,
-        span: Span,
-    }
-
-    enum CowBuf<'a> {
-        Slice {
-            value: &'a [u8],
-            start: usize,
-            end: usize,
-        },
-        Owned {
-            value: Vec<u8>,
-        },
-    }
-
-    impl<'a> CowBuf<'a> {
-        fn init(value: &'a [u8]) -> Self {
-            Self::Slice {
-                value,
-                start: 0,
-                end: 0,
-            }
-        }
-
-        fn to_cow_slice(self) -> Cow<'a, [u8]> {
-            match self {
-                Self::Slice { value, start, end } => {
-                    Cow::Borrowed(&value[start..end])
-                }
-                Self::Owned { value } => Cow::Owned(value),
-            }
-        }
-
-        fn start(&mut self, i: usize) {
-            let Self::Slice { start, end, .. } = self
-            else {
-                unreachable!()
-            };
-
-            *start = i;
-            *end = i;
-        }
-
-        fn push(&mut self, b: u8) {
-            match self {
-                Self::Slice { end, .. } => *end += 1,
-                Self::Owned { value } => value.push(b),
-            }
-        }
-
-        fn clone_push(&mut self, b: u8) {
-            match *self {
-                Self::Slice { value, start, end } => {
-                    let mut owned = value[start..end].to_owned();
-                    owned.push(b);
-                    *self = Self::Owned { value: owned }
-                }
-                Self::Owned { ref mut value } => {
-                    value.push(b);
-                }
-            }
-        }
-    }
-
-    impl<'a> Deref for RawFieldValue<'a> {
-        type Target = Cow<'a, [u8]>;
-
-        fn deref(&self) -> &Self::Target {
-            &self.value
-        }
-    }
-
-    impl Error for ParseError {}
-
-    impl FromStr for MaybeBoxedStr {
-        type Err = Infallible;
-
-        fn from_str(s: &str) -> Result<Self, Self::Err> {
-            Ok(Self {
-                value: if s.is_empty() {
-                    Some(s.to_owned().into_boxed_str())
-                }
-                else {
-                    None
-                },
-            })
-        }
-    }
-
-    impl ParseOptions {
-        pub fn parse<'a>(
-            &self,
-            bytes: &'a [u8],
-        ) -> Result<Message<'a>, ParseError> {
-            /* parse startline */
-
-            let (startline, offset_startline) = self.parse_startline(bytes)?;
-
-            /* parse fields */
-
-            let (raw_fields, offset_fields) = self
-                .parse_raw_fields(&bytes[offset_startline..])
-                .map_err(|mut err| {
-                    err.span >>= offset_startline;
-                    err
-                })?;
-
-            let body = &bytes[offset_startline + offset_fields..];
-
-            Ok(match startline {
-                StartLine::RequestLine {
-                    method,
-                    target,
-                    version,
-                } => Message::Request(Request {
-                    method,
-                    target,
-                    version,
-                    // fields,
-                    body,
-                }),
-                StartLine::StatusLine {
-                    version,
-                    status,
-                    reason,
-                } => Message::Response(Response {
-                    version,
-                    status,
-                    reason,
-                    // fields,
-                    body,
-                }),
-            })
-        }
-
-        ///
-        /// first byte is double-quote
-        ///
-        /// return (parsed-bytes (exclude double quote), offset)
-        ///
-        fn parse_qstr<'a>(
-            &self,
-            bytes: &'a [u8],
-        ) -> Result<(Cow<'a, [u8]>, usize), usize> {
-            use State::*;
-
-            let mut state = Start;
-            let mut buf = CowBuf::init(bytes);
-
-            #[derive(Clone, Copy)]
-            enum State {
-                Start,
-                InStr,
-                OutStr,
-                Quoting,
-            }
-
-            let mut i = 0;
-
-            while i < bytes.len() {
-                let b = bytes[i];
-
-                state = match (state, b) {
-                    (Start, DQUOTE) => {
-                        buf.start(i + 1);
-
-                        InStr
-                    }
-                    (
-                        InStr,
-                        WS![] | 0x21 | 0x23..=0x5b | 0x5d..=0x7e | OBS_TEXT![],
-                    ) => {
-                        buf.push(b);
-
-                        state
-                    }
-                    (InStr, BACKSLASH) => Quoting,
-                    (Quoting, WS![] | VCHAR![] | OBS_TEXT![]) => {
-                        buf.clone_push(b);
-
-                        InStr
-                    }
-                    (InStr, DQUOTE) => OutStr,
-                    _ => break,
-                };
-
-                i += 1;
-            }
-
-            match state {
-                OutStr => Ok((buf.to_cow_slice(), i)),
-                _ => Err(i + 1),
-            }
-        }
-
-        /// return (str, offset)
-        fn consume_token<'a>(&self, bytes: &'a [u8]) -> (&'a str, usize) {
-            let mut i = 0;
-
-            while i < bytes.len() {
-                match bytes[i] {
-                    TCHAR![] => (),
-                    _ => break,
-                }
-
-                i += 1;
-            }
-
-            (unsafe { from_utf8_unchecked(&bytes[..i]) }, i)
-        }
-
-        fn parse_parameters<'a>(
-            &self,
-            bytes: &'a [u8],
-        ) -> Result<Parameters<'a>, Span> {
-            use State::*;
-
-            use super::ParameterValue::*;
-
-            macro_rules! throw {
-                ($range:expr) => {
-                    Err(Span::from($range))?
-                };
-            }
-
-            #[derive(Clone, Copy)]
-            enum State {
-                Start,
-                InPreOWS,
-                InPostOWS,
-            }
-
-            let mut raw_parameters: HashMap<&'a str, Vec<ParameterValue<'a>>> =
-                HashMap::new();
-
-            let mut i = 0;
-            let mut state = Start;
-
-            while i < bytes.len() {
-                state = match (state, bytes[i]) {
-                    (Start, WS![]) => {
-                        i += 1;
-
-                        InPreOWS
-                    },
-                    (Start | InPreOWS, b';') => {
-                        i += 1;
-
-                        InPostOWS
-                    },
-                    (InPreOWS | InPostOWS, WS![]) => {
-                        i += 1;
-
-                        state
-                    },
-                    (InPostOWS, TCHAR![]) => {
-                        let (param_name, offset) =
-                            self.consume_token(&bytes[i..]);
-                        i += offset;
-
-                        if i == bytes.len() {
-                            throw!(..bytes.len())
-                        }
-
-                        let (param_value, offset) = if bytes[i] == DQUOTE {
-                            let (qstr, offset) = self
-                                .parse_qstr(&bytes[i..])
-                                .map_err(|offset| Span::from(i..i + offset))?;
-
-                            (QStr(qstr), offset)
-                        }
-                        else {
-                            let (token, offset) =
-                                self.consume_token(&bytes[i..]);
-
-                            (Token(token), offset)
-                        };
-                        i += offset;
-
-                        match raw_parameters.entry(param_name) {
-                            Entry::Occupied(mut occupied) => {
-                                occupied.get_mut().push(param_value);
-                            }
-                            Entry::Vacant(vacant) => {
-                                vacant.insert(vec![param_value]);
-                            }
-                        }
-
-                        InPreOWS
-                    }
-                    _ => throw!(..=i),
-                };
-            }
-
-            Ok(Parameters {
-                value: raw_parameters,
-            })
-        }
-
-        fn transmute_field_value_as_singleton<'a>(
-            &self,
-            value: &'a RawFieldValue<'a>,
-        ) -> SingletonFieldValue<'a> {
-            use QuotingEnv::*;
-            use SingletonFieldValue::*;
-            use State::*;
-
-            let mut state = Start;
-            let mut buf = CowBuf::init(value);
-
-            #[derive(Clone, Copy)]
-            enum State {
-                Start,
-                InToken,
-                InComment(usize),
-                InStr,
-                OutStr,
-                Quoting(QuotingEnv),
-                Unknown,
-            }
-
-            #[derive(Clone, Copy)]
-            enum QuotingEnv {
-                Comment(usize),
-                Str,
-            }
-
-            for (i, b) in value.iter().cloned().enumerate() {
-                state = match (state, b) {
-                    (Start, TCHAR![]) => {
-                        buf.start(i);
-
-                        InToken
-                    }
-                    (Start, DQUOTE) => {
-                        buf.start(i + 1);
-
-                        InStr
-                    }
-                    (Start, LPAREN) => InComment(1),
-                    (InToken, TCHAR![]) => {
-                        buf.push(b);
-
-                        state
-                    }
-                    (
-                        InStr,
-                        WS![] | 0x21 | 0x23..=0x5b | 0x5d..=0x7e | OBS_TEXT![],
-                    ) => {
-                        buf.push(b);
-
-                        state
-                    }
-                    (
-                        InComment(..),
-                        WS![]
-                        | 0x21..=0x27
-                        | 0x2A..=0x5B
-                        | 0x5D..=0x7E
-                        | OBS_TEXT![],
-                    ) => state,
-                    (InStr | InComment(..), BACKSLASH) => {
-                        Quoting(match state {
-                            InStr => Str,
-                            InComment(cnt) => Comment(cnt),
-                            _ => unreachable!(),
-                        })
-                    }
-                    (Quoting(env), WS![] | VCHAR![] | OBS_TEXT![]) => {
-                        match env {
-                            Str => {
-                                buf.clone_push(b);
-
-                                InStr
-                            }
-                            Comment(cnt) => InComment(cnt),
-                        }
-                    }
-                    (InStr, DQUOTE) => OutStr,
-                    (InComment(cnt), RPAREN) => {
-                        if cnt > 0 {
-                            InComment(cnt - 1)
-                        }
-                        else {
-                            Start
-                        }
-                    }
-                    _ => Unknown,
-                }
-            }
-
-            match state {
-                InToken => Token({
-                    match buf.to_cow_slice() {
-                        Cow::Borrowed(borrowed) => Cow::Borrowed(unsafe {
-                            from_utf8_unchecked(borrowed)
-                        }),
-                        Cow::Owned(owned) => Cow::Owned(unsafe {
-                            String::from_utf8_unchecked(owned)
-                        }),
-                    }
-                }),
-                OutStr => QStr(buf.to_cow_slice()),
-                _ => Oth(Cow::Borrowed(value)),
-            }
-        }
-
-        // pub fn transmute_field_value_as_list<'a>(
-        //     &self,
-        //     value: &'a [RawFieldValue<'a>],
-        // ) -> Box<[Member<'a>]> {
-
-        //     let mut members = Vec::with_capacity(value.len());
-
-        //     for raw_field_value in value {
-        //         let mut i = 0;
-
-        //         /* try parse token */
-        //         while i < raw_field_value.len() {
-        //             match raw_field_value[i] {
-        //                 TCHAR![] => (),
-        //                 b'=' => {
-        //                     // parse parameters
-        //                 },
-        //                 b';' => {
-        //                     // parse parameter
-        //                 }
-        //             }
-        //         }
-        //     }
-
-        //     members.into_boxed_slice()
-        // }
-
-        fn parse_raw_fields<'a>(
-            &self,
-            bytes: &'a [u8],
-        ) -> Result<(RawFields<'a>, usize), ParseError> {
-            let mut i = 0;
-
-            macro_rules! throw {
-                ($range:expr) => {
-                    Err(error!($range))?
-                };
-            }
-
-            macro_rules! error {
-                ($range:expr) => {
-                    ParseError {
-                        reason: InvalidStartLine,
-                        span: ($range).into(),
-                    }
-                };
-            }
-
-            macro_rules! consume {
-                ($contpat:pat, $endpat:pat $(,$throw:ident)?) => {{
-                    let mut j = i;
-
-                    loop {
-                        if j == bytes.len() {
-                            throw!(j..j+1)
-                        }
-
-                        match bytes[j] {
-                            $contpat => (),
-                            $endpat => break,
-                            $( _ => $throw!(j..j + 1))?
-                        }
-
-                        j += 1;
-                    }
-
-                    let value = &bytes[i..j];
-                    #[allow(unused)]
-                    i = j;
-                    value
-                }};
-            }
-
-            macro_rules! FIELD_VCHAR {
-                () => {
-                    WS![] | VCHAR![] | OBS_TEXT![]
-                };
-            }
-
-            let mut fields: RawFields = HashMap::new();
-
-            'finish: loop {
-                /* parse field name */
-
-                let field_name = unsafe {
-                    from_utf8_unchecked(consume!(TCHAR![], b':', throw))
-                };
-
-                /* consume `:` */
-
-                i += 1;
-
-                /* consume option white spaces */
-
-                consume!(WS![], _);
-
-                /* parse field value */
-
-                let field_value_start = i;
-
-                let mut field_value =
-                    Cow::Borrowed(consume!(FIELD_VCHAR![], CR, throw));
-
-                /* consume option white spaces */
-
-                /* consume CRLF */
-
-                consume!(CR, LF, throw);
-
-                i += 1;
-
-                'nextline: loop {
-                    if i == bytes.len() {
-                        throw!(i..bytes.len())
-                    }
-
-                    match bytes[i] {
-                        // obsolete line folding (replace CRLF with SP)
-                        SP => {
-                            if field_value.is_borrowed() {
-                                field_value =
-                                    Cow::Owned(field_value.into_owned());
-                            }
-
-                            consume!(WS![], _);
-
-                            field_value.to_mut().push(SP);
-                            field_value.to_mut().extend(consume!(
-                                FIELD_VCHAR![],
-                                CR,
-                                throw
-                            ));
-
-                            consume!(CR, LF, throw);
-                        }
-                        #[allow(unreachable_patterns)]
-                        CR | FIELD_VCHAR![] => {
-                            /* push field */
-
-                            let field_value_end = i;
-
-                            let field_value = RawFieldValue {
-                                value: field_value,
-                                span: (field_value_start..field_value_end)
-                                    .into(),
-                            };
-
-                            match fields.entry(&field_name) {
-                                Entry::Occupied(mut occupied) => {
-                                    occupied.get_mut().push(field_value);
-                                }
-                                Entry::Vacant(vacant) => {
-                                    vacant.insert(vec![field_value]);
-                                }
-                            }
-
-                            if bytes[i] == CR {
-                                consume!(CR, LF, throw);
-                                break 'finish;
-                            }
-                            else {
-                                break 'nextline;
-                            }
-                        }
-                        _ => throw!(i..i + 1),
-                    }
-                }
-            }
-
-            Ok((fields, i))
-        }
-
-        fn lift_fields<'a>(
-            &self,
-            raw_fields: RawFields<'a>,
-        ) -> Result<Fields, ParseError> {
-            let mut fields = HashMap::new();
-
-            for (name, value) in raw_fields.into_iter() {}
-
-            Ok(Fields { value: fields })
-        }
-
-        fn parse_startline(
-            &self,
-            bytes: &[u8],
-        ) -> Result<(StartLine, usize), ParseError> {
-            let mut i = 0;
-
-            macro_rules! throw {
-                ($range:expr) => {
-                    Err(error!($range))?
-                };
-            }
-
-            macro_rules! error {
-                ($range:expr) => {
-                    ParseError {
-                        reason: InvalidStartLine,
-                        span: ($range).into(),
-                    }
-                };
-            }
-
-            macro_rules! consume {
-                (s=$name:literal) => {
-                    {
-                        let name = $name;
-                        consume!(s=name);
-                    }
-                };
-                (s=$name:ident) => {
-                    let offset = $name.len();
-
-                    if bytes.len() < i + offset {
-                        throw!(i..bytes.len())
-                    }
-
-                    if &bytes[i..i + offset] == $name {
-                        i += offset;
-                    }
-                    else {
-                        throw!(i..i + offset)
-                    }
-                };
-                ({
-                    s=$name:literal => $e:path
-                    $(,s=$namex:literal => $ex:path)*
-                }
-                ) =>
-                {{
-                    let offset = $name.len();
-
-                    if bytes.len() < i + offset {
-                        throw!(i..bytes.len())
-                    }
-
-                    if &bytes[i..i + offset] == $name {
-                        i += offset;
-                        $e
-                    }
-                    $(else if &bytes[i..i + offset] == $namex {
-                        i += offset;
-                        $ex
-                    })*
-                    else {
-                        throw!(i..bytes.len())
-                    }
-                }};
-                (c=$char:ident) => {
-                    let offset = 1;
-
-                    if bytes.len() < i + offset {
-                        throw!(i..bytes.len())
-                    }
-
-                    if bytes[i + offset] == $char {
-                        i += offset;
-                    }
-                    else {
-                        throw!(i..i + offset)
-                    }
-                };
-                (@$e:ident $offset:expr) => {{
-                    let offset = $offset;
-
-                    if bytes.len() < i + offset {
-                        throw!(i..bytes.len())
-                    }
-
-                    let raw = std::str::from_utf8(&bytes[i..i + offset])
-                        .map_err(|_| error!(i..i + offset))?;
-
-                    #[allow(unused)]
-                    i += offset;
-
-                    raw.parse::<$e>().map_err(|_| error!(i..i + offset))?
-                }};
-            }
-
-            macro_rules! offset {
-                (=$c:literal) => {{
-                    let c = $c;
-                    offset!(=c $reason)
-                }};
-                (=$c:ident) => {{
-                    let Some(offset) =
-                        bytes[i..].iter().position(|b| *b == $c)
-                    else {
-                        throw!(i..bytes.len())
-                    };
-
-                    offset
-                }};
-            }
-
-            enum State {
-                Start,
-                H,
-                P,
-                Request { method: Method },
-                Response { version: Version },
-                Finish(StartLine),
-            }
-
-            use State::*;
-
-            let mut state = Start;
-
-            while i < bytes.len() {
-                state = match (state, bytes[i]) {
-                    // status line (response)
-                    (Start, b'H') => H,
-                    (Start, b'O') => {
-                        consume!(s = b"Options");
-
-                        Request {
-                            method: Method::Options,
-                        }
-                    }
-                    (Start, b'G') => {
-                        consume!(s = b"Get");
-
-                        Request {
-                            method: Method::Get,
-                        }
-                    }
-                    (Start, b'P') => {
-                        i += 1;
-
-                        P
-                    }
-                    (Start, b'D') => {
-                        consume!(s = b"Delete");
-
-                        Request {
-                            method: Method::Delete,
-                        }
-                    }
-                    (H, b'T') => {
-                        /* parse status line */
-
-                        consume!(s = b"TTP/");
-
-                        let version = consume!(
-                            {
-                                s=b"0.9" => Version::HTTP09,
-                                s=b"1.0" => Version::HTTP10,
-                                s=b"1.1" => Version::HTTP11
-                            }
-                        );
-
-                        Response { version }
-                    }
-                    (H, b'e') => {
-                        consume!(s = b"ead");
-
-                        Request {
-                            method: Method::Head,
-                        }
-                    }
-                    (P, b'o') => {
-                        consume!(s = b"ost");
-
-                        Request {
-                            method: Method::Post,
-                        }
-                    }
-                    (P, b'u') => {
-                        consume!(s = b"ut");
-
-                        Request {
-                            method: Method::Put,
-                        }
-                    }
-                    (P, b'a') => {
-                        consume!(s = b"atch");
-
-                        Request {
-                            method: Method::Patch,
-                        }
-                    }
-                    /* It may allow more lenient parsing that
-                    such whitespace includes one or more of the following octets:
-                    SP, HTAB, VT (%x0B), FF (%x0C), or bare CR
-                    (however it's not recommend) */
-                    (Request { method }, SP) => {
-                        consume!(c = SP);
-
-                        let target = consume!(@RequestTarget offset!(=SP));
-
-                        consume!(c = SP);
-
-                        let version = consume!(@Version 8);
-
-                        Finish(StartLine::RequestLine {
-                            method,
-                            target,
-                            version,
-                        })
-                    }
-                    (Response { version }, SP) => {
-                        consume!(c = SP);
-
-                        let status = consume!(@StatusCode 3);
-
-                        consume!(c = SP);
-
-                        let reason =
-                            consume!(@MaybeBoxedStr offset!(=CR)).value;
-
-                        Finish(StartLine::StatusLine {
-                            version,
-                            status,
-                            reason,
-                        })
-                    }
-                    (Finish(startline), ..) => {
-                        consume!(s = CRLF);
-
-                        return Ok((startline, i));
-                    }
-                    _ => throw!(i..i + 1),
-                }
-            }
-
-            throw!(i..bytes.len())
-        }
-    }
-
-    impl<'a> Message<'a> {
-        pub fn parse(bytes: &'a [u8]) -> Result<Self, ParseError> {
-            STANDARD.parse(bytes)
-        }
-    }
-}
-
 
 #[cfg(test)]
 mod tests {
@@ -1337,6 +657,10 @@ mod tests {
             FieldName::ContentType
         );
         assert_eq!(
+            "content-type".parse::<FieldName>().unwrap(),
+            FieldName::ContentType
+        );
+        assert_eq!(
             "ABC".to_owned(),
             FieldName::NonSandard("ABC".to_owned().into_boxed_str())
                 .to_string()
@@ -1345,5 +669,22 @@ mod tests {
             "ABC".parse::<FieldName>().unwrap(),
             FieldName::NonSandard("ABC".to_owned().into_boxed_str())
         );
+    }
+
+    #[test]
+    fn verify_slice_usage() {
+        let v = vec![1];
+        assert_eq!(&v[1..], &[]); // allow
+        assert_eq!(&v[2..], &[]); // range overflow
+    }
+
+    #[test]
+    fn verify_num_parse() {
+        assert_eq!("02".parse::<usize>().unwrap(), 2);
+        assert!(" 2".parse::<usize>().is_err());
+        assert_eq!("2".parse::<usize>().unwrap(), 2);
+
+        assert_eq!("1.000".parse::<f32>().unwrap(), 1.000);
+        assert_eq!("0.8".parse::<f32>().unwrap(), 0.8);
     }
 }
