@@ -1,10 +1,12 @@
 use std::{
-    collections::HashMap, mem::transmute, num::ParseIntError, str::FromStr,
-    string::ToString,
+    collections::HashMap, fmt::Display, mem::transmute, num::ParseIntError,
+    str::FromStr, string::ToString,
 };
 
-use m6ptr::FlatCow;
-use m6tobytes::derive_to_bits;
+use chrono::{DateTime, Datelike, TimeZone, Timelike, Weekday};
+use m6ptr::ByteStr;
+pub use m6ptr::FlatCow;
+use m6tobytes::{derive_from_bits, derive_to_bits};
 pub use parsing::*;
 use strum::{Display, EnumString};
 use url::Url;
@@ -12,8 +14,7 @@ use url::Url;
 use super::{charset, mime};
 
 pub mod parsing;
-pub mod request;
-pub mod response;
+pub mod writing;
 
 ////////////////////////////////////////////////////////////////////////////////
 //// Constants
@@ -25,28 +26,28 @@ const HYPHEN: char = '-' as char;
 ////////////////////////////////////////////////////////////////////////////////
 //// Structures
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum Message<'a> {
     Request(Request<'a>),
     Response(Response<'a>),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Request<'a> {
     pub method: Method,
     pub target: RequestTarget,
     pub version: Version,
     pub fields: Fields<'a>,
-    pub body: &'a [u8],
+    pub body: FlatCow<'a, ByteStr>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Response<'a> {
     pub version: Version,
     pub status: StatusCode,
     pub reason: Option<Box<str>>,
     pub fields: Fields<'a>,
-    pub body: &'a [u8],
+    pub body: FlatCow<'a, ByteStr>,
 }
 
 /// case-sensitive
@@ -65,19 +66,30 @@ pub enum Method {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum RequestTarget {
+    ///
+    /// example: GET /where?q=now HTTP/1.1
+    ///
     /// absolute path ['?' query]
+    ///
+    /// When making a request directly to an origin server,
+    /// other than a CONNECT or server-wide OPTIONS request (as detailed below)
     Origin {
         path: Box<str>,
         query: Option<Box<str>>,
     },
     /// absolute uri
-    Absolute {
-        uri: Url,
-    },
-    Authority {
-        host: Box<str>,
-        port: u16,
-    },
+    ///
+    /// When making a request to a proxy,
+    /// other than a CONNECT or server-wide OPTIONS request (as detailed below)
+    Absolute { uri: Url },
+    ///
+    ///
+    /// CONNECT www.example.com:80 HTTP/1.1
+    ///
+    Authority { host: Box<str>, port: u16 },
+    /// example: OPTIONS * HTTP/1.1
+    ///
+    /// is only used for a server-wide OPTIONS request
     Asterisk,
 }
 
@@ -183,28 +195,42 @@ pub enum StatusCode {
     HTTPVersionNotSupported = 505,
 }
 
-
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Fields<'a> {
-    pub fields: HashMap<FieldName, Field<'a>>,
+    pub fields: Vec<Field<'a>>,
 }
 
 #[derive(
     Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, EnumString, Display,
 )]
 pub enum FieldName {
+    #[strum(serialize = "Host", ascii_case_insensitive)]
+    Host,
     #[strum(serialize = "Content-Type", ascii_case_insensitive)]
     ContentType,
     #[strum(serialize = "Accept", ascii_case_insensitive)]
     Accept,
+    #[strum(serialize = "Server", ascii_case_insensitive)]
+    Server,
+    #[strum(serialize = "Date", ascii_case_insensitive)]
+    Date,
     #[strum(serialize = "{0}", default)]
     NonSandard(Box<str>),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
+pub struct Host<'a> {
+    pub host: FlatCow<'a, str>,
+    pub port: Option<u16>,
+}
+
+#[derive(Debug)]
 pub enum Field<'a> {
+    Host(Host<'a>),
     ContentType(MediaType<'a>),
     Accept(Accept<'a>),
+    Server(Server<'a>),
+    Date(Date),
     NonSandard(RawField<'a>),
 }
 
@@ -214,8 +240,8 @@ pub enum Field<'a> {
 /// which is name here.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RawField<'a> {
-    pub name: &'a str,
-    pub value: Box<[FlatCow<'a, [u8]>]>,
+    pub name: FlatCow<'a, str>,
+    pub value: Box<[FlatCow<'a, ByteStr>]>,
 }
 
 ///
@@ -235,7 +261,7 @@ pub struct Parameters<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParameterValue<'a> {
     Token(FlatCow<'a, str>),
-    QStr(FlatCow<'a, [u8]>),
+    QStr(FlatCow<'a, ByteStr>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -308,7 +334,7 @@ pub enum ContentCoding {
 ///
 /// [HTTP-date](https://datatracker.ietf.org/doc/html/rfc9110#name-date-time-formats)
 ///
-/// HTTP-date    = IMF-fixdate / obs-date
+/// HTTP-date = IMF-fixdate / obs-date
 ///
 /// An example of the preferred format is
 ///
@@ -323,15 +349,17 @@ pub enum ContentCoding {
 ///
 /// `chrono::TimeZone::with_ymd_and_hms`
 ///
+#[derive(Debug)]
 pub struct Date {
     pub day_name: DayName,
     pub month: MonthName,
-    pub day: u8,
-    pub year: u8,
+    pub day: Day,
+    pub year: Year,
     pub time_of_day: TimeOfDay,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, EnumString, Display)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, EnumString, Debug, Display)]
+#[derive_from_bits(u8)]
 #[repr(u8)]
 pub enum DayName {
     Mon = 1,
@@ -343,7 +371,8 @@ pub enum DayName {
     Sun,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, EnumString, Display)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, EnumString, Debug, Display)]
+#[derive_from_bits(u8)]
 #[repr(u8)]
 pub enum MonthName {
     Jan = 1,
@@ -360,14 +389,18 @@ pub enum MonthName {
     Dec,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive_to_bits(u8)]
 #[repr(transparent)]
 pub struct Day(u8);
 
 #[repr(transparent)]
 pub struct Month(u8);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive_to_bits(u16)]
 #[repr(transparent)]
-pub struct Year(u8);
+pub struct Year(u16);
 
 ///
 /// time-of-day  = hour ":" minute ":" second
@@ -381,9 +414,126 @@ pub struct TimeOfDay {
     second: u8,
 }
 
+///
+/// ```no_main
+/// Server = product *( RWS ( product / comment ) )
+/// ```
+///
+#[derive(Debug, Clone)]
+pub struct Server<'a> {
+    pub product: Product<'a>,
+    pub rem: Vec<ProductOrComment<'a>>,
+}
+
+#[derive(Debug, Clone)]
+pub enum ProductOrComment<'a> {
+    Product(Product<'a>),
+    Comment(FlatCow<'a, ByteStr>),
+}
+
+///
+/// ```no_main
+/// product = token [ "/" product-version ]
+/// product-version = token
+/// ```
+#[derive(Debug, Clone)]
+pub struct Product<'a> {
+    pub name: FlatCow<'a, str>,
+    pub version: Option<FlatCow<'a, str>>,
+}
 
 ////////////////////////////////////////////////////////////////////////////////
 //// Implementations
+
+impl StatusCode {
+    pub fn reason(&self) -> Box<str> {
+        use StatusCode::*;
+
+        match self {
+            Continue => "Continue",
+            SwitchingProtocols => "Switching Protocols",
+            Ok => "OK",
+            Created => "Created",
+            Accepted => "Accepted",
+            NonAuthoriativeInfo => "Non-Authorizative Information",
+            NonContent => "No Content",
+            ResetContent => "Reset Content",
+            PartialContent => "Partial Content",
+            MultipleChoices => "Multiple Choices",
+            MovePermanently => "Move Permanently",
+            Found => "Found",
+            SeeOther => "See Other",
+            NotModified => "Not Modified",
+            Deprecated305 => "",
+            Deprecated306 => "",
+            TemporaryRedirect => "Temporary Redirect",
+            PermanentRedirect => "Permanent Redirect",
+            BadRequest => "Bad Request",
+            Unauthoriozed => "Unauthorized",
+            PaymentRequired => "Payment Required",
+            Forbidden => "Forbidden",
+            NotFound => "Not Found",
+            MethodNotAllowed => "Method Not Allowed",
+            NotAcceptable => "Not Acceptable",
+            ProxyAuthenticationRequired => "Proxy Authentication Required",
+            RequestTimeout => "Request Timeout",
+            Conflict => "Conflict",
+            Gone => "Gone",
+            LengthRequired => "Length Required",
+            PreconditionFailed => "Precondition Failed",
+            ContentTooLarge => "Content Too Large",
+            URITooLong => "URI Too Long",
+            UnsupportedMediaType => "Unsupported Media Type",
+            RangeNotSatisfiable => "Range Not Satisfiable",
+            ExpectationFailed => "Expectation Failed",
+            April1Unused => "",
+            MisdirectedRequest => "Misdirected Request",
+            UnprocessableContent => "Unprocessable Content",
+            UpgradeRequired => "Upgrade Required",
+            InternalServerError => "Internal Server Error",
+            NotImplemented => "Not Implemented",
+            BadGateway => "Bad Gateway",
+            ServiceUnavailable => "Service Unavailable",
+            GatewayTimeout => "Gateway Timeout",
+            HTTPVersionNotSupported => "HTTP Version Not Supported",
+        }
+        .to_string()
+        .into_boxed_str()
+    }
+}
+
+impl<'a> Fields<'a> {
+    pub fn iter(&self) -> impl Iterator<Item = &Field<'a>> {
+        self.fields.iter()
+    }
+
+    pub fn host(&self) -> Option<&Host<'a>> {
+        self.fields
+            .iter()
+            .find(|field| matches!(field, Field::Host(..)))
+            .map(|field| {
+                let Field::Host(host) = field
+                else {
+                    unreachable!()
+                };
+                host
+            })
+    }
+}
+
+impl Date {
+    /// `Sun, 06 Nov 1994 08:49:37 GMT    ; IMF-fixdate`
+    pub fn imf_fixdate(&self) -> String {
+        format!(
+            "{}, {:02} {} {:04} {} GMT",
+            self.day_name,
+            self.day.to_bits(),
+            self.month,
+            self.year.to_bits(),
+            self.time_of_day
+        )
+    }
+}
 
 impl FromStr for Date {
     type Err = ();
@@ -424,7 +574,7 @@ impl FromStr for Date {
 
                 require!(..1, SP);
 
-                let day = or_else!(s[1..3].parse::<u8>());
+                let day = or_else!(s[1..3].parse::<Day>());
 
                 require!(3..4, SP);
 
@@ -432,7 +582,7 @@ impl FromStr for Date {
 
                 require!(7..8, SP);
 
-                let year = or_else!(s[8..12].parse::<u8>());
+                let year = or_else!(s[8..12].parse::<Year>());
 
                 require!(12..13, SP);
 
@@ -456,7 +606,7 @@ impl FromStr for Date {
 
                 require!(..1, SP);
 
-                let day = or_else!(s[1..3].parse::<u8>());
+                let day = or_else!(s[1..3].parse::<Day>());
 
                 require!(3..4, HYPHEN);
 
@@ -464,7 +614,7 @@ impl FromStr for Date {
 
                 require!(7..8, HYPHEN);
 
-                let year = or_else!(s[8..10].parse::<u8>());
+                let year = or_else!(s[8..10].parse::<Year>());
 
                 require!(10..12, SP);
 
@@ -498,7 +648,7 @@ impl FromStr for Date {
 
             require!(3..4, SP);
 
-            let day = or_else!(s[4..6].trim_start().parse::<u8>());
+            let day = or_else!(s[4..6].trim_start().parse::<Day>());
 
             require!(6..7, SP);
 
@@ -506,7 +656,7 @@ impl FromStr for Date {
 
             require!(15..16, SP);
 
-            let year = or_else!(s[16..20].parse::<u8>());
+            let year = or_else!(s[16..20].parse::<Year>());
 
             Ok(Self {
                 day_name,
@@ -516,6 +666,58 @@ impl FromStr for Date {
                 time_of_day,
             })
         }
+    }
+}
+
+impl<Tz: TimeZone> From<DateTime<Tz>> for Date {
+    fn from(value: DateTime<Tz>) -> Self {
+        let date = value.date_naive();
+        let time = value.time();
+
+        Self {
+            day_name: date.weekday().into(),
+            month: MonthName::fetch_from(&date),
+            day: Day::fetch_from(&date),
+            year: Year::fetch_from(&date),
+            time_of_day: time.into(),
+        }
+    }
+}
+
+impl From<Weekday> for DayName {
+    fn from(value: Weekday) -> Self {
+        unsafe { Self::from_u8(value.num_days_from_monday() as u8 + 1) }
+    }
+}
+
+impl MonthName {
+    fn fetch_from<D: Datelike>(value: &D) -> Self {
+        unsafe { Self::from_u8(value.month0() as u8 + 1) }
+    }
+}
+
+impl Year {
+    fn fetch_from<D: Datelike>(value: &D) -> Self {
+        let (is_ad, year) = value.year_ce();
+
+        debug_assert!(is_ad, "found ad year");
+        debug_assert!(year <= 9999, "year out of range");
+
+        Self(year as u16)
+    }
+}
+
+impl FromStr for Year {
+    type Err = ParseIntError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(s.parse::<u16>()?))
+    }
+}
+
+impl Day {
+    fn fetch_from<D: Datelike>(value: &D) -> Self {
+        Self(value.day() as u8)
     }
 }
 
@@ -557,25 +759,44 @@ impl FromStr for TimeOfDay {
     }
 }
 
-// impl Field {
-//     pub fn name(&self) -> &str {
-//         match self {
-//             Self::NonSandard(raw) => &raw.name,
-//         }
-//     }
-// }
+impl<T: Timelike> From<T> for TimeOfDay {
+    fn from(value: T) -> Self {
+        let hour = value.hour() as u8;
+        let minute = value.minute() as u8;
+        let second = value.second() as u8;
 
-impl<'a> Fields<'a> {
-    // pub fn push(&mut self, field: Field) {
-    //     match self.value.binary_search_by_key(&field.name(), |f| f.name()) {
-    //         Ok(_idx) => unimplemented!(),
-    //         Err(idx) => self.value.insert(idx, field),
-    //     }
-    // }
+        Self {
+            hour,
+            minute,
+            second,
+        }
+    }
+}
+
+impl Display for TimeOfDay {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:02}:{:02}:{:02}", self.hour, self.minute, self.second)
+    }
+}
+
+impl<'a> Field<'a> {
+    pub fn name(&self) -> FieldName {
+        use FieldName::*;
+
+        match self {
+            Self::Host(..) => Host,
+            Self::ContentType(..) => ContentType,
+            Self::Accept(..) => Accept,
+            Self::Server(..) => Server,
+            Self::Date(..) => Date,
+            Self::NonSandard(RawField { name, .. }) => {
+                NonSandard(name.to_string().into_boxed_str())
+            }
+        }
+    }
 }
 
 impl<'a> Parameters<'a> {}
-
 
 impl TryFrom<u16> for StatusCode {
     type Error = Box<str>;
@@ -603,6 +824,41 @@ impl FromStr for StatusCode {
         s.parse::<u16>()
             .map_err(|err| err.to_string().into_boxed_str())
             .and_then(|uint| uint.try_into())
+    }
+}
+
+impl RequestTarget {
+    pub fn path(&self) -> &str {
+        use RequestTarget::*;
+
+        match self {
+            Origin { path, .. } => path,
+            Absolute { uri } => uri.path(),
+            Authority { .. } => "/",
+            Asterisk => "/",
+        }
+    }
+
+    pub fn query(&self) {}
+}
+
+impl<'a> FromStr for Host<'a> {
+    type Err = Box<str>;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let url =
+            Url::parse(s).map_err(|err| err.to_string().into_boxed_str())?;
+
+        let Some(host) = url.host_str()
+        else {
+            Err("No Host".to_string().into_boxed_str())?
+        };
+
+        //
+        Ok(Self {
+            host: FlatCow::<str>::own_new(host.to_owned()),
+            port: url.port(),
+        })
     }
 }
 
@@ -638,6 +894,7 @@ impl FromStr for RequestTarget {
         })
     }
 }
+
 
 
 

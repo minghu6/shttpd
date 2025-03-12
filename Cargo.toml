@@ -3,13 +3,19 @@ name = "osimodel"
 version = "0.1.0"
 edition = "2024"
 description = ""
-authors = [ "minghu6 <a19678zy@163.com>" ]
+authors = ["minghu6 <a19678zy@163.com>"]
 
 [features]
 default = ["full"]
 # default = ["parse"]
 parse = ["dep:m6parsing"]
-http = ["dep:cookie", "dep:url", "dep:m6parsing", "dep:m6ptr"]
+http = [
+    "dep:cookie",
+    "dep:url",
+    "dep:m6parsing",
+    "dep:m6ptr",
+    "dep:chrono",
+]
 full = ["parse", "http"]
 
 [dependencies]
@@ -20,9 +26,10 @@ strum = { version = "0.27", features = ["derive"] }
 # optional http
 cookie = { version = "0.18", optional = true }
 url = { version = "2.5.4", optional = true }
+chrono = { version = "0.4", optional = true }
 
 # optional common
 m6parsing = { path = "../m6coll/m6parsing", optional = true }
-m6ptr = { path = "../m6coll/m6ptr", optional = true }
+m6ptr = { path = "../m6coll/m6ptr", features = ["cow", "bytestr"], optional = true }
 
 [dev-dependencies]

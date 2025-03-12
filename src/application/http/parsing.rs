@@ -8,18 +8,19 @@
 ///
 use std::{
     ascii::Char::*,
-    borrow::{Borrow, Cow},
     collections::{HashMap, hash_map::Entry},
     convert::Infallible,
     error::Error,
-    ops::{Deref, Index, RangeBounds},
+    ops::Deref,
     str::FromStr,
 };
 
 use ParseErrorReason::*;
 use derive_more::derive::Display;
 use m6parsing::Span;
-use m6ptr::{CowBuf, FlatCow};
+use m6ptr::{
+    ByteStr, ConsumeBytesAs, ConsumeBytesInto, CowBuf, FlatCow, FromBytesAs,
+};
 
 use super::*;
 
@@ -79,6 +80,7 @@ macro_rules! QDTEXT {
     };
 }
 
+/// WS + VCHAR + OBS_TEXT - '('(28) ')'(29) '/'(5C)
 macro_rules! CTEXT {
     () => {
         WS![]
@@ -192,9 +194,6 @@ trait LiftFieldValue<'a>: Sized {
     fn lift(raw_field_values: Vec<RawFieldValue<'a>>) -> Result<Self, Span>;
 }
 
-trait ConsumeBytes<'a>: Sized {
-    fn consume(bytes: &FlatCow<'a, [u8]>) -> Result<(Self, usize), ()>;
-}
 
 ////////////////////////////////////////////////////////////////////////////////
 //// Structures
@@ -219,6 +218,7 @@ pub enum ParseErrorReason {
     UncoupledCR,
     InvalidStartLine,
     InvalidFieldLine(FieldName),
+    RequestLackHostField,
 }
 
 enum StartLine {
@@ -238,16 +238,31 @@ struct MaybeBoxedStr {
     value: Option<Box<str>>,
 }
 
-type RawFields<'a> = HashMap<&'a str, Vec<RawFieldValue<'a>>>;
+type RawFields<'a> = HashMap<FlatCow<'a, str>, Vec<RawFieldValue<'a>>>;
 
 #[derive(Debug, Clone)]
 struct RawFieldValue<'a> {
-    value: FlatCow<'a, [u8]>,
+    value: FlatCow<'a, ByteStr>,
     span: Span,
 }
 
 ////////////////////////////////////////////////////////////////////////////////
 //// Implementations
+
+impl<'a> LiftFieldValue<'a> for Host<'a> {
+    fn lift(raw_field_values: Vec<RawFieldValue<'a>>) -> Result<Self, Span> {
+        if raw_field_values.len() > 1 {
+            Err(raw_field_values[1].span)?;
+        }
+
+        let RawFieldValue { value, span } =
+            raw_field_values.into_iter().next().unwrap();
+
+        let s = std::str::from_utf8(&value[..]).map_err(|_| span)?;
+
+        s.parse().map_err(|_| span)
+    }
+}
 
 impl<'a> LiftFieldValue<'a> for AcceptCharset {
     fn lift(raw_field_values: Vec<RawFieldValue<'a>>) -> Result<Self, Span> {
@@ -275,12 +290,15 @@ impl<'a> LiftFieldValue<'a> for Accept<'a> {
                 let RawFieldValue { mut value, span } = member;
 
                 let (media_range, range_type_offset) =
-                    mime::MediaRangeType::consume(&value).map_err(|_| span)?;
+                    mime::MediaRangeType::consume_bytes_into(
+                        value.as_bytestr(),
+                    )
+                    .map_err(|_| span)?;
 
                 value = value.as_slice_cow(range_type_offset..);
 
                 let (parameters, parameters_offset) =
-                    consume_parameters(&value).map_err(|_| span)?;
+                    Parameters::consume_bytes_as(&value).map_err(|_| span)?;
 
                 let weight = consume_maybe_weight(&value[parameters_offset..])
                     .map_err(|_| span)?
@@ -301,8 +319,12 @@ impl<'a> LiftFieldValue<'a> for Accept<'a> {
     }
 }
 
-impl<'a> ConsumeBytes<'a> for mime::MediaRangeType {
-    fn consume(bytes: &FlatCow<'a, [u8]>) -> Result<(Self, usize), ()> {
+impl ConsumeBytesInto for mime::MediaRangeType {
+    type Err = ();
+
+    fn consume_bytes_into(
+        bytes: &ByteStr,
+    ) -> Result<(Self, usize), Self::Err> {
         use mime::{MediaRangeType::*, MediaTopType::*};
 
         macro_rules! throw {
@@ -361,24 +383,95 @@ impl<'a> ConsumeBytes<'a> for mime::MediaRangeType {
     }
 }
 
-impl<'a> LiftFieldValue<'a> for MediaType<'a> {
-    fn lift(
-        mut raw_field_value: Vec<RawFieldValue<'a>>,
-    ) -> Result<Self, Span> {
-        let RawFieldValue { value, span } = raw_field_value.remove(0);
+impl<'a> ConsumeBytesAs<'a> for Server<'a> {
+    type Err = ();
 
+    fn consume_bytes_as<'i: 'a>(
+        bytes: &FlatCow<'i, ByteStr>,
+    ) -> Result<(Self, usize), Self::Err> {
+        let mut i = 0;
+
+        let (product, product_offset) = Product::consume_bytes_as(bytes)?;
+        i += product_offset;
+
+        let mut rem = vec![];
+
+        while i < bytes.len() {
+            let ws_offset = consume_ws(&bytes[i..]);
+
+            if ws_offset == 0 || i + ws_offset == bytes.len() {
+                Err(())?;
+            }
+
+            i += ws_offset;
+
+            if bytes[i] == LPAREN {
+                let (comment, comment_offset) =
+                    consume_comment(bytes.as_slice_cow(i..))?;
+
+                i += comment_offset;
+
+                rem.push(ProductOrComment::Comment(comment));
+            }
+            else {
+                let (product_next, product_next_offset) =
+                    Product::consume_bytes_as(&bytes.as_slice_cow(i..))?;
+
+                i += product_next_offset;
+
+                rem.push(ProductOrComment::Product(product_next));
+            }
+        }
+
+        Ok((Self { product, rem }, i))
+    }
+}
+
+impl<'o> ConsumeBytesAs<'o> for Product<'o> {
+    type Err = ();
+
+    fn consume_bytes_as<'i: 'o>(
+        bytes: &FlatCow<'i, ByteStr>,
+    ) -> Result<(Self, usize), Self::Err> {
+        let mut i = 0;
+
+        let (name, name_offset) = consume_token(bytes)?;
+        i += name_offset;
+
+        let version = if bytes[i] == b'/' {
+            i += 1;
+            let (version, version_offset) =
+                consume_token(&bytes.as_slice_cow(i..))?;
+
+            i += version_offset;
+            Some(version)
+        }
+        else {
+            None
+        };
+
+        Ok((Self { name, version }, i))
+    }
+}
+
+impl<'o> ConsumeBytesAs<'o> for MediaType<'o> {
+    type Err = ();
+
+    fn consume_bytes_as<'i: 'o>(
+        bytes: &FlatCow<'i, ByteStr>,
+    ) -> Result<(Self, usize), Self::Err> {
         macro_rules! throw {
             () => {
-                Err(span)?
+                Err(())?
             };
         }
 
-        let Some(dpos) = value.iter().position(|b| *b == b'/')
+        let Some(dpos) = bytes.iter().position(|b| *b == b'/')
         else {
             throw!()
         };
 
-        let Some(epos) = value[dpos + 1..].iter().position(|b| match *b {
+        let Some(e_offset) = bytes[dpos + 1..].iter().position(|b| match *b {
             TCHAR![] => false,
             _ => true,
         })
@@ -386,29 +479,145 @@ impl<'a> LiftFieldValue<'a> for MediaType<'a> {
             throw!()
         };
 
+        let epos = dpos + 1 + e_offset;
+
         let mime =
-            match safe_decode_str!(&value[..dpos]).to_lowercase().as_str() {
+            match safe_decode_str!(&bytes[..dpos]).to_lowercase().as_str() {
                 "application" => unimplemented!(),
                 "text" => mime::MediaType::Text(
-                    safe_decode_str!(&value[dpos + 1..epos])
+                    safe_decode_str!(&bytes[dpos + 1..epos])
                         .parse()
-                        .map_err(|_| span)?,
+                        .map_err(|_| ())?,
                 ),
                 "audio" | "font" | "haptics" | "image" | "message"
                 | "model" | "multipart" | "video" => unimplemented!(),
                 _ => throw!(),
             };
 
-        let (parameters, _parameters_offset) =
-            consume_parameters(&value.as_slice_cow(epos..))
-                .map_err(|_| span)?;
+        let (parameters, p_offset) =
+            Parameters::consume_bytes_as(&bytes.as_slice_cow(epos..)).map_err(|_| ())?;
 
-        Ok(MediaType { mime, parameters })
+        Ok((Self { mime, parameters }, epos + p_offset))
+    }
+}
+
+impl<'a> LiftFieldValue<'a> for MediaType<'a> {
+    fn lift(
+        mut raw_field_value: Vec<RawFieldValue<'a>>,
+    ) -> Result<Self, Span> {
+        let RawFieldValue { value, span } = raw_field_value.remove(0);
+
+        let media_type =
+            Self::from_bytes_as(&value.into()).map_err(|_| span)?;
+
+        Ok(media_type)
+    }
+}
+
+impl<'o> ConsumeBytesAs<'o> for Parameters<'o> {
+    type Err = ();
+
+    fn consume_bytes_as<'i: 'o>(
+        bytes: &FlatCow<'i, ByteStr>,
+    ) -> Result<(Self, usize), Self::Err> {
+        use State::*;
+
+        use super::ParameterValue::*;
+
+        macro_rules! throw {
+            () => {
+                Err(())?
+            };
+        }
+
+        #[derive(Clone, Copy)]
+        enum State {
+            Start,
+            InPreOWS,
+            InPostOWS,
+        }
+
+        let mut raw_parameters: HashMap<_, Vec<ParameterValue>> =
+            HashMap::new();
+
+        let mut i = 0;
+        let mut pre_i = 0; // for `q`
+        let mut state = Start;
+
+        while i < bytes.len() {
+            state = match (state, bytes[i]) {
+                (Start, WS![]) => {
+                    i += 1;
+
+                    InPreOWS
+                }
+                (Start | InPreOWS, b';') => {
+                    pre_i = i;
+                    i += 1;
+
+                    InPostOWS
+                }
+                (InPreOWS | InPostOWS, WS![]) => {
+                    i += 1;
+
+                    state
+                }
+                (InPostOWS, TCHAR![]) => {
+                    let (param_name, offset) =
+                        consume_token(&bytes.as_slice_cow(i..))?;
+                    i += offset;
+
+                    // disjoin with optional weight
+                    if param_name == "q" {
+                        i = pre_i;
+                        break;
+                    }
+
+                    if i == bytes.len() {
+                        throw!()
+                    }
+
+                    let (param_value, offset) = if bytes[i] == DQUOTE {
+                        let (qstr, offset) =
+                            consume_qstr(&bytes.as_slice_cow(i..))?;
+
+                        (QStr(qstr), offset)
+                    }
+                    else {
+                        let (token, offset) =
+                            consume_token(&bytes.as_slice_cow(i..))?;
+
+                        (Token(token), offset)
+                    };
+
+                    i += offset;
+
+                    match raw_parameters.entry(param_name) {
+                        Entry::Occupied(mut occupied) => {
+                            occupied.get_mut().push(param_value);
+                        }
+                        Entry::Vacant(vacant) => {
+                            vacant.insert(vec![param_value]);
+                        }
+                    }
+
+                    InPreOWS
+                }
+                _ => throw!(),
+            };
+        }
+
+        Ok((
+            Parameters {
+                value: raw_parameters,
+            },
+            i,
+        ))
     }
 }
 
 impl<'a> Deref for RawFieldValue<'a> {
-    type Target = FlatCow<'a, [u8]>;
+    type Target = FlatCow<'a, ByteStr>;
 
     fn deref(&self) -> &Self::Target {
         &self.value
@@ -416,6 +625,20 @@ impl<'a> Deref for RawFieldValue<'a> {
 }
 
 impl Error for ParseError {}
+
+impl FromStr for Server<'_> {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let bytes = s.as_bytes();
+
+        let server = Server::from_bytes_as(&FlatCow::<ByteStr>::own_new(
+            bytes.to_owned().into(),
+        ))?;
+
+        Ok(server)
+    }
+}
 
 impl FromStr for MaybeBoxedStr {
     type Err = Infallible;
@@ -435,16 +658,16 @@ impl FromStr for MaybeBoxedStr {
 impl ParseOptions {
     pub fn parse<'a>(
         &'a self,
-        bytes: &'a [u8],
+        bytes: &FlatCow<'a, ByteStr>,
     ) -> Result<Message<'a>, ParseError> {
         /* parse startline */
 
-        let (startline, offset_startline) = self.parse_startline(bytes)?;
+        let (startline, offset_startline) = self.parse_startline(&bytes)?;
 
         /* parse fields */
 
         let (raw_fields, offset_fields) = self
-            .parse_raw_fields(&bytes[offset_startline..])
+            .parse_raw_fields(&bytes.as_slice_cow(offset_startline..))
             .map_err(|mut err| {
                 err.span >>= offset_startline;
                 err
@@ -452,7 +675,17 @@ impl ParseOptions {
 
         let fields = self.lift_fields(raw_fields)?;
 
-        let body = &bytes[offset_startline + offset_fields..];
+        if matches!(startline, StartLine::RequestLine { .. })
+            && fields.host().is_none()
+        {
+            Err(ParseError {
+                reason: ParseErrorReason::RequestLackHostField,
+                span: (offset_startline..offset_startline + offset_fields)
+                    .into(),
+            })?
+        }
+
+        let body = bytes.as_slice_cow(offset_startline + offset_fields..);
 
         Ok(match startline {
             StartLine::RequestLine {
@@ -481,8 +714,8 @@ impl ParseOptions {
     }
 
     fn parse_raw_fields<'a>(
-        &'a self,
-        bytes: &'a [u8],
+        &self,
+        bytes: &FlatCow<'a, ByteStr>,
     ) -> Result<(RawFields<'a>, usize), ParseError> {
         let mut i = 0;
 
@@ -519,9 +752,10 @@ impl ParseOptions {
                     j += 1;
                 }
 
-                let value = &bytes[i..j];
+                let value = bytes.as_slice_cow(i..j);
                 #[allow(unused)]
                 i = j;
+
                 value
             }};
         }
@@ -537,7 +771,7 @@ impl ParseOptions {
         'finish: loop {
             /* parse field name */
 
-            let field_name = safe_decode_str!(consume!(TCHAR![], b':', throw));
+            let field_name = consume!(TCHAR![], b':', throw).try_into().unwrap();
 
             /* consume `:` */
 
@@ -551,11 +785,7 @@ impl ParseOptions {
 
             let field_value_start = i;
 
-            let mut field_value = FlatCow::<[u8]>::borrow_new(consume!(
-                FIELD_VCHAR![],
-                CR,
-                throw
-            ));
+            let mut field_value = consume!(FIELD_VCHAR![], CR, throw);
 
             /* consume option white spaces */
 
@@ -576,11 +806,9 @@ impl ParseOptions {
                         consume!(WS![], _);
 
                         field_value.to_mut().push(SP);
-                        field_value.to_mut().extend(consume!(
-                            FIELD_VCHAR![],
-                            CR,
-                            throw
-                        ));
+                        field_value.to_mut().push_str(
+                            consume!(FIELD_VCHAR![], CR, throw).as_bytestr(),
+                        );
 
                         consume!(CR, LF, throw);
                     }
@@ -595,7 +823,7 @@ impl ParseOptions {
                             span: (field_value_start..field_value_end).into(),
                         };
 
-                        match fields.entry(&field_name) {
+                        match fields.entry(field_name) {
                             Entry::Occupied(mut occupied) => {
                                 occupied.get_mut().push(field_value);
                             }
@@ -624,9 +852,7 @@ impl ParseOptions {
         &'a self,
         raw_fields: RawFields<'a>,
     ) -> Result<Fields<'a>, ParseError> {
-        use FieldName::*;
-
-        let mut fields = HashMap::new();
+        let mut fields = Vec::new();
 
         for (raw_field_name, raw_field_value) in raw_fields.into_iter() {
             let field_name = raw_field_name.parse::<FieldName>().unwrap();
@@ -643,10 +869,13 @@ impl ParseOptions {
             }
 
             let field_value = match &field_name {
-                ContentType => Field::ContentType(or_else!(MediaType::lift(
-                    raw_field_value
-                ))?),
-                NonSandard(..) => Field::NonSandard(RawField {
+                FieldName::Host => {
+                    Field::Host(or_else!(Host::lift(raw_field_value))?)
+                }
+                FieldName::ContentType => Field::ContentType(or_else!(
+                    MediaType::lift(raw_field_value)
+                )?),
+                FieldName::NonSandard(..) => Field::NonSandard(RawField {
                     name: raw_field_name,
                     value: raw_field_value
                         .into_iter()
@@ -657,7 +886,7 @@ impl ParseOptions {
                 _ => todo!(),
             };
 
-            fields.insert(field_name, field_value);
+            fields.push(field_value);
         }
 
         Ok(Fields { fields })
@@ -911,7 +1140,7 @@ impl ParseOptions {
 
 impl<'a> Message<'a> {
     pub fn parse(bytes: &'a [u8]) -> Result<Self, ParseError> {
-        STANDARD.parse(bytes)
+        STANDARD.parse(&FlatCow::<ByteStr>::borrow_new(bytes.into()))
     }
 }
 
@@ -919,27 +1148,14 @@ impl<'a> Message<'a> {
 ////////////////////////////////////////////////////////////////////////////////
 //// Functions
 
-pub fn as_slice_cow<'a, T, B, I>(cow: Cow<'a, B>, index: I) -> Cow<'a, B>
-where
-    T: Borrow<B> + Index<I>,
-    B: Index<I, Output = B> + Clone,
-    I: RangeBounds<usize>,
-{
-    match cow {
-        Cow::Borrowed(borrowed) => Cow::Borrowed(&borrowed[index]),
-        Cow::Owned(owned) => Cow::Owned(owned[index].clone()),
-    }
-}
-
-
 ///
 /// first byte is double-quote
 ///
 /// return (parsed-bytes (exclude double quote), offset)
 ///
 fn consume_qstr<'a>(
-    bytes: &FlatCow<'a, [u8]>,
-) -> Result<(FlatCow<'a, [u8]>, usize), ()> {
+    bytes: &FlatCow<'a, ByteStr>,
+) -> Result<(FlatCow<'a, ByteStr>, usize), ()> {
     use State::*;
 
     let mut state = Start;
@@ -993,7 +1209,7 @@ fn consume_qstr<'a>(
 
 /// return (str, offset)
 fn consume_token<'a>(
-    bytes: &FlatCow<'a, [u8]>,
+    bytes: &FlatCow<'a, ByteStr>,
 ) -> Result<(FlatCow<'a, str>, usize), ()> {
     let mut i = 0;
 
@@ -1008,7 +1224,6 @@ fn consume_token<'a>(
 
     Ok((bytes.as_slice_cow(..i).try_into().unwrap(), i))
 }
-
 
 #[allow(unused)]
 fn consume_field_value_as_singleton<'a>(
@@ -1104,110 +1319,12 @@ fn consume_field_value_as_singleton<'a>(
     }
 }
 
-fn consume_parameters<'a>(
-    bytes: &FlatCow<'a, [u8]>,
-) -> Result<(Parameters<'a>, usize), ()> {
-    use State::*;
-
-    use super::ParameterValue::*;
-
-    macro_rules! throw {
-        () => {
-            Err(())?
-        };
-    }
-
-    #[derive(Clone, Copy)]
-    enum State {
-        Start,
-        InPreOWS,
-        InPostOWS,
-    }
-
-    let mut raw_parameters: HashMap<_, Vec<ParameterValue<'a>>> =
-        HashMap::new();
-
-    let mut i = 0;
-    let mut pre_i = 0; // for `q`
-    let mut state = Start;
-
-    while i < bytes.len() {
-        state = match (state, bytes[i]) {
-            (Start, WS![]) => {
-                i += 1;
-
-                InPreOWS
-            }
-            (Start | InPreOWS, b';') => {
-                pre_i = i;
-                i += 1;
-
-                InPostOWS
-            }
-            (InPreOWS | InPostOWS, WS![]) => {
-                i += 1;
-
-                state
-            }
-            (InPostOWS, TCHAR![]) => {
-                let (param_name, offset) =
-                    consume_token(&bytes.as_slice_cow(i..))?;
-                i += offset;
-
-                // disjoin with optional weight
-                if param_name == "q" {
-                    i = pre_i;
-                    break;
-                }
-
-                if i == bytes.len() {
-                    throw!()
-                }
-
-                let (param_value, offset) = if bytes[i] == DQUOTE {
-                    let (qstr, offset) =
-                        consume_qstr(&bytes.as_slice_cow(i..))?;
-
-                    (QStr(qstr), offset)
-                }
-                else {
-                    let (token, offset) =
-                        consume_token(&bytes.as_slice_cow(i..))?;
-
-                    (Token(token), offset)
-                };
-
-                i += offset;
-
-                match raw_parameters.entry(param_name) {
-                    Entry::Occupied(mut occupied) => {
-                        occupied.get_mut().push(param_value);
-                    }
-                    Entry::Vacant(vacant) => {
-                        vacant.insert(vec![param_value]);
-                    }
-                }
-
-                InPreOWS
-            }
-            _ => throw!(),
-        };
-    }
-
-    Ok((
-        Parameters {
-            value: raw_parameters,
-        },
-        i,
-    ))
-}
-
 fn consume_maybe_weight(bytes: &[u8]) -> Result<Option<(f32, usize)>, ()> {
     let mut i = 0;
 
     /* consume maybe space */
 
-    i += consume_obs(bytes);
+    i += consume_ws(bytes);
 
     if i < bytes.len() && bytes[i] == Semicolon.to_u8() {
         i += 1;
@@ -1216,7 +1333,7 @@ fn consume_maybe_weight(bytes: &[u8]) -> Result<Option<(f32, usize)>, ()> {
         return Ok(None);
     }
 
-    i += consume_obs(bytes);
+    i += consume_ws(bytes);
 
     if i + 2 < bytes.len()
         && (&bytes[i..i + 2] == b"q=" || &bytes[i..i + 2] == b"Q=")
@@ -1271,7 +1388,7 @@ fn consume_maybe_weight(bytes: &[u8]) -> Result<Option<(f32, usize)>, ()> {
     }))
 }
 
-fn consume_obs(bytes: &[u8]) -> usize {
+fn consume_ws(bytes: &[u8]) -> usize {
     let mut i = 0;
 
     /* consume maybe space */
@@ -1286,4 +1403,67 @@ fn consume_obs(bytes: &[u8]) -> usize {
     }
 
     i
+}
+
+/// another impl style (without explicit state)
+fn consume_comment<'a>(
+    bytes: FlatCow<'a, ByteStr>,
+) -> Result<(FlatCow<'a, ByteStr>, usize), ()> {
+    let mut i = 0;
+    let mut cnt = 0;
+    let mut escaping = false;
+    let mut buf = CowBuf::from(&bytes);
+
+    if bytes.is_empty() || bytes[0] != LPAREN {
+        Err(())?
+    }
+
+    for b in bytes.iter().cloned() {
+        if escaping {
+            match b {
+                WS![] | VCHAR![] | OBS_TEXT![] => buf.push(b),
+                _ => Err(())?,
+            }
+
+            escaping = false;
+        }
+        else {
+            match b {
+                b'(' => {
+                    if cnt > 0 {
+                        buf.push(b);
+                    }
+
+                    cnt += 1;
+                }
+                b')' => {
+                    if cnt == 0 {
+                        Err(())?
+                    }
+                    else if cnt == 1 {
+                        i += 2;
+                        break;
+                    }
+                    else {
+                        buf.push(b);
+                        cnt -= 1;
+                    }
+                }
+                b'\\' => {
+                    escaping = true;
+                    buf.clone_push(b);
+                }
+                CTEXT![] => {
+                    if cnt == 0 {
+                        Err(())?
+                    }
+                }
+                _ => Err(())?,
+            }
+        }
+
+        i += 1;
+    }
+
+    Ok((buf.to_cow(), i))
 }
