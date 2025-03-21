@@ -1,0 +1,76 @@
+#! /usr/bin/env python
+
+import os
+import random
+
+ENV_Q_PREFIX = 'SHTTPD_Q_'
+ENV_PERSIS_ROOT = 'SHTTPD_PERSIS_ROOT'
+ENV_PERSIS_DIR = 'SHTTPD_PERSIS_DIR'
+
+
+q = {}
+env_persis_root = None
+env_persis_dir = None
+
+for key, val in os.environ.items():
+    if key.startswith(ENV_Q_PREFIX):
+        q[key[len(ENV_Q_PREFIX):]] = val
+
+    if key.startswith(ENV_PERSIS_ROOT):
+        env_persis_root = val
+    if key.startswith(ENV_PERSIS_DIR):
+        env_persis_dir = val
+
+
+persis_file = os.path.join(env_persis_dir, "1.txt")
+
+def gen_num(range):
+    n = random.randrange(range)
+    with open(persis_file, 'w') as w:
+        w.write(f'{range},{n}')
+
+
+def get_num():
+    s = None
+    with open(persis_file, 'r') as r:
+        s = r.read()
+    return [int(i) for i in s.split(',')]
+
+
+def cli():
+    print(f'content-type: text/plain; charset=UTF-8')
+
+    g = q.get('G')
+    if g:
+        g = int(g) if g else 100
+        print(f'Generate a new number between 0-{g}')
+        gen_num(g)
+        return
+
+    n = q.get('N')
+    if n:
+        n = int(n) if n else 0
+        (range, target) = get_num()
+        print(f'range between 0-{range}')
+
+        if n == target:
+            print("BINGO!")
+        elif n < target:
+            print('Too Small')
+        else:
+            print('Too Big')
+        return
+
+    print('Guess number from 0-x (default: 100)')
+    print('use query `g` to generate new number, g supply the range')
+    print('use query `n` to supply your guess')
+
+    if not os.path.exists(persis_file):
+        print('Not Exist')
+    else:
+        (range, target) = get_num()
+        print(f'Range: {range}')
+
+
+if __name__ == '__main__':
+    cli()

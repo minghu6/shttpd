@@ -1,2 +1,4 @@
 /target
 .vscode
+examples/example-1/log/
+shttpd

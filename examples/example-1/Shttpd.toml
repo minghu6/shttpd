@@ -1,0 +1,21 @@
+
+[cgi]
+root = "examples/example-1/cgi"
+
+[[cgi.mapping]]
+route = "/hi"
+cgi = "print-hi"
+
+[[cgi.mapping]]
+route = "/demo/fake"
+cgi = "guess-num"
+
+[doc]
+root = "examples/example-1"
+index = "index.html"
+
+[persist]
+root = "examples/example-1/persist"
+
+[log]
+config = "examples/example-1/log4rs.yaml"

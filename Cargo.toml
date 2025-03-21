@@ -5,20 +5,37 @@ edition = "2024"
 description = ""
 authors = [ "minghu6 <a19678zy@163.com>" ]
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [dependencies]
-clap = { version = "^3", features = ["derive"] }
-clap_complete = "3.1.1"
-shellexpand = "2.1"
 
-osimodel = { path = "../osimodel", features = ["http"]}
+# cli
+clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
 
 # http
+osimodel = { path = "../osimodel", features = ["http"]}
 cookie = "0.18"
+chrono = "0.4"
+qstring = "0.7.2"
+# http.encode/decode
+# gzip, deflate
+flate2 = { version = "1.0" }
+# br
+brotli = { version = "7" }
 
+# log
+log = "0.4"
+log4rs = { version = "1.3", features = ["background_rotation"] }
 
-[[bin]]
-name="shttpd"
-path="bin/shttpd"
+# config
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+m6ptr = { path = "../m6coll/m6ptr", features = ["cow", "bytestr"] }
 
+# async
+futures = { version = "0.3", features = ["thread-pool", "executor"] }
+
+# cache
+# lazy_static = "1"
+
+[dev-dependencies]
+clap = { version = "4", features = ["derive", "cargo"] }

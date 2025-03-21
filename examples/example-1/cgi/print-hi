@@ -1,0 +1,16 @@
+#! /usr/bin/env python
+
+import os
+
+ENV_Q_PREFIX = 'SHTTPD_Q_'
+q = {}
+for key, val in os.environ.items():
+    if key.startswith(ENV_Q_PREFIX):
+        q[key[len(ENV_Q_PREFIX):]] = val
+
+
+if __name__ == '__main__':
+    print(f'Content-Type: text/plain; charset=UTF-8')
+    print("Queries:")
+    for key, val in q.items():
+        print(f'{key}: {val}')
