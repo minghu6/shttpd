@@ -91,6 +91,19 @@ macro_rules! CTEXT {
     };
 }
 
+macro_rules! require_singleton_value {
+    ($raw_field_values: ident) => {{
+        if $raw_field_values.len() > 1 {
+            Err($raw_field_values[1].span)?;
+        }
+
+        let RawFieldValue { value, span } =
+            $raw_field_values.into_iter().next().unwrap();
+
+        (value, span)
+    }};
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 //// Constants
 
@@ -251,12 +264,7 @@ struct RawFieldValue<'a> {
 
 impl<'a> LiftFieldValue<'a> for Host<'a> {
     fn lift(raw_field_values: Vec<RawFieldValue<'a>>) -> Result<Self, Span> {
-        if raw_field_values.len() > 1 {
-            Err(raw_field_values[1].span)?;
-        }
-
-        let RawFieldValue { value, span } =
-            raw_field_values.into_iter().next().unwrap();
+        let (value, span) = require_singleton_value!(raw_field_values);
 
         let s = std::str::from_utf8(&value[..]).map_err(|_| span)?;
 
@@ -269,14 +277,6 @@ impl<'a> LiftFieldValue<'a> for AcceptCharset {
         let _members = Self::common_split_list_field_value(raw_field_values)?;
 
         todo!()
-    }
-}
-
-impl<'a> LiftFieldValue<'a> for ContentType<'a> {
-    fn lift(raw_field_values: Vec<RawFieldValue<'a>>) -> Result<Self, Span> {
-        Ok(Self {
-            value: MediaType::lift(raw_field_values)?,
-        })
     }
 }
 
@@ -316,6 +316,21 @@ impl<'a> LiftFieldValue<'a> for Accept<'a> {
             .try_collect::<Vec<(MediaRange<'_>, f32)>>()?;
 
         Ok(Self { values })
+    }
+}
+
+impl<'a> LiftFieldValue<'a> for Connection {
+    fn lift(raw_field_values: Vec<RawFieldValue<'a>>) -> Result<Self, Span> {
+        let (value, span) = require_singleton_value!(raw_field_values);
+
+        let s = std::str::from_utf8(&value[..]).map_err(|_| span)?;
+
+        if s.trim().to_ascii_lowercase() == "close" {
+            Ok(Self)
+        }
+        else {
+            Err(span)
+        }
     }
 }
 
@@ -495,7 +510,8 @@ impl<'o> ConsumeBytesAs<'o> for MediaType<'o> {
             };
 
         let (parameters, p_offset) =
-            Parameters::consume_bytes_as(&bytes.as_slice_cow(epos..)).map_err(|_| ())?;
+            Parameters::consume_bytes_as(&bytes.as_slice_cow(epos..))
+                .map_err(|_| ())?;
 
         Ok((Self { mime, parameters }, epos + p_offset))
     }
@@ -537,8 +553,7 @@ impl<'o> ConsumeBytesAs<'o> for Parameters<'o> {
             InPostOWS,
         }
 
-        let mut raw_parameters: HashMap<_, Vec<ParameterValue>> =
-            HashMap::new();
+        let mut raw_parameters: HashMap<_, ParameterValue> = HashMap::new();
 
         let mut i = 0;
         let mut pre_i = 0; // for `q`
@@ -592,14 +607,7 @@ impl<'o> ConsumeBytesAs<'o> for Parameters<'o> {
 
                     i += offset;
 
-                    match raw_parameters.entry(param_name) {
-                        Entry::Occupied(mut occupied) => {
-                            occupied.get_mut().push(param_value);
-                        }
-                        Entry::Vacant(vacant) => {
-                            vacant.insert(vec![param_value]);
-                        }
-                    }
+                    raw_parameters.insert(param_name, param_value);
 
                     InPreOWS
                 }
@@ -659,7 +667,7 @@ impl ParseOptions {
     pub fn parse<'a>(
         &'a self,
         bytes: &FlatCow<'a, ByteStr>,
-    ) -> Result<Message<'a>, ParseError> {
+    ) -> Result<MessageHeader<'a>, ParseError> {
         /* parse startline */
 
         let (startline, offset_startline) = self.parse_startline(&bytes)?;
@@ -692,23 +700,21 @@ impl ParseOptions {
                 method,
                 target,
                 version,
-            } => Message::Request(Request {
+            } => MessageHeader::RequestHeader(RequestHeader {
                 method,
                 target,
                 version,
                 fields,
-                body,
             }),
             StartLine::StatusLine {
                 version,
                 status,
                 reason,
-            } => Message::Response(Response {
+            } => MessageHeader::ResponseHeader(ResponseHeader {
                 version,
                 status,
                 reason,
                 fields,
-                body,
             }),
         })
     }
@@ -771,7 +777,8 @@ impl ParseOptions {
         'finish: loop {
             /* parse field name */
 
-            let field_name = consume!(TCHAR![], b':', throw).try_into().unwrap();
+            let field_name =
+                consume!(TCHAR![], b':', throw).try_into().unwrap();
 
             /* consume `:` */
 
@@ -869,19 +876,23 @@ impl ParseOptions {
             }
 
             let field_value = match &field_name {
+                FieldName::Connection => {
+                    or_else!(Connection::lift(raw_field_value))?;
+
+                    Field::Connection
+                }
                 FieldName::Host => {
                     Field::Host(or_else!(Host::lift(raw_field_value))?)
                 }
                 FieldName::ContentType => Field::ContentType(or_else!(
                     MediaType::lift(raw_field_value)
                 )?),
-                FieldName::NonSandard(..) => Field::NonSandard(RawField {
+                FieldName::NonStandard(..) => Field::NonStandard(RawField {
                     name: raw_field_name,
                     value: raw_field_value
                         .into_iter()
                         .map(|RawFieldValue { value, .. }| value)
-                        .collect::<Vec<_>>()
-                        .into_boxed_slice(),
+                        .collect::<Vec<_>>(),
                 }),
                 _ => todo!(),
             };
@@ -1023,14 +1034,14 @@ impl ParseOptions {
                 // status line (response)
                 (Start, b'H') => H,
                 (Start, b'O') => {
-                    consume!(s = b"Options");
+                    consume!(s = b"ptions");
 
                     Request {
                         method: Method::Options,
                     }
                 }
                 (Start, b'G') => {
-                    consume!(s = b"Get");
+                    consume!(s = b"et");
 
                     Request {
                         method: Method::Get,
@@ -1042,7 +1053,7 @@ impl ParseOptions {
                     P
                 }
                 (Start, b'D') => {
-                    consume!(s = b"Delete");
+                    consume!(s = b"elete");
 
                     Request {
                         method: Method::Delete,
@@ -1138,7 +1149,7 @@ impl ParseOptions {
     }
 }
 
-impl<'a> Message<'a> {
+impl<'a> MessageHeader<'a> {
     pub fn parse(bytes: &'a [u8]) -> Result<Self, ParseError> {
         STANDARD.parse(&FlatCow::<ByteStr>::borrow_new(bytes.into()))
     }

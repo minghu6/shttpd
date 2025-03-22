@@ -6,8 +6,7 @@ description = ""
 authors = ["minghu6 <a19678zy@163.com>"]
 
 [features]
-default = ["full"]
-# default = ["parse"]
+default = ["parse"]
 parse = ["dep:m6parsing"]
 http = [
     "dep:cookie",
@@ -15,6 +14,7 @@ http = [
     "dep:m6parsing",
     "dep:m6ptr",
     "dep:chrono",
+    "dep:flate2",
 ]
 full = ["parse", "http"]
 
@@ -27,6 +27,12 @@ strum = { version = "0.27", features = ["derive"] }
 cookie = { version = "0.18", optional = true }
 url = { version = "2.5.4", optional = true }
 chrono = { version = "0.4", optional = true }
+
+# optional http.encode/decode
+# gzip, deflate
+flate2 = { version = "1.0", optional = true }
+# brotli = { version = "7",  optional = true }
+
 
 # optional common
 m6parsing = { path = "../m6coll/m6parsing", optional = true }

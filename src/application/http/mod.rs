@@ -1,12 +1,18 @@
 use std::{
-    collections::HashMap, fmt::Display, mem::transmute, num::ParseIntError,
-    str::FromStr, string::ToString,
+    collections::HashMap,
+    fmt::{Debug, Display},
+    mem::transmute,
+    num::ParseIntError,
+    ops::Deref,
+    str::FromStr,
+    string::ToString,
 };
 
 use chrono::{DateTime, Datelike, TimeZone, Timelike, Weekday};
 use m6ptr::ByteStr;
 pub use m6ptr::FlatCow;
 use m6tobytes::{derive_from_bits, derive_to_bits};
+use parameters::ContentCoding;
 pub use parsing::*;
 use strum::{Display, EnumString};
 use url::Url;
@@ -39,6 +45,7 @@ pub struct Request<'a> {
     pub version: Version,
     pub fields: Fields<'a>,
     pub body: FlatCow<'a, ByteStr>,
+    pub trailer: Option<Fields<'a>>
 }
 
 #[derive(Debug)]
@@ -48,6 +55,29 @@ pub struct Response<'a> {
     pub reason: Option<Box<str>>,
     pub fields: Fields<'a>,
     pub body: FlatCow<'a, ByteStr>,
+    pub trailer: Option<Fields<'a>>
+}
+
+#[derive(Debug)]
+pub enum MessageHeader<'a> {
+    RequestHeader(RequestHeader<'a>),
+    ResponseHeader(ResponseHeader<'a>),
+}
+
+#[derive(Debug)]
+pub struct RequestHeader<'a> {
+    pub method: Method,
+    pub target: RequestTarget,
+    pub version: Version,
+    pub fields: Fields<'a>,
+}
+
+#[derive(Debug)]
+pub struct ResponseHeader<'a> {
+    pub version: Version,
+    pub status: StatusCode,
+    pub reason: Option<Box<str>>,
+    pub fields: Fields<'a>,
 }
 
 /// case-sensitive
@@ -203,19 +233,26 @@ pub struct Fields<'a> {
 #[derive(
     Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, EnumString, Display,
 )]
+#[strum(ascii_case_insensitive)]
 pub enum FieldName {
-    #[strum(serialize = "Host", ascii_case_insensitive)]
-    Host,
-    #[strum(serialize = "Content-Type", ascii_case_insensitive)]
-    ContentType,
-    #[strum(serialize = "Accept", ascii_case_insensitive)]
+    #[strum(serialize = "Accept")]
     Accept,
-    #[strum(serialize = "Server", ascii_case_insensitive)]
-    Server,
-    #[strum(serialize = "Date", ascii_case_insensitive)]
+    Connection,
+    #[strum(serialize = "Content-Type")]
+    ContentType,
+    #[strum(serialize = "Content-Encoding")]
+    ContentEncoding,
+    #[strum(serialize = "Date")]
     Date,
+    #[strum(serialize = "Host")]
+    Host,
+    #[strum(serialize = "Server")]
+    Server,
+    #[strum(serialize = "Transfer-Encoding")]
+    TransferEncoding,
+
     #[strum(serialize = "{0}", default)]
-    NonSandard(Box<str>),
+    NonStandard(Box<str>),
 }
 
 #[derive(Debug)]
@@ -226,12 +263,16 @@ pub struct Host<'a> {
 
 #[derive(Debug)]
 pub enum Field<'a> {
-    Host(Host<'a>),
-    ContentType(MediaType<'a>),
     Accept(Accept<'a>),
-    Server(Server<'a>),
+    /// Connection: close
+    Connection,
+    ContentType(MediaType<'a>),
+    ContentEncoding(ContentEncoding),
     Date(Date),
-    NonSandard(RawField<'a>),
+    Host(Host<'a>),
+    Server(Server<'a>),
+    TransferEncoding(TransferEncoding<'a>),
+    NonStandard(RawField<'a>),
 }
 
 /// derive trait `Ord` based on
@@ -241,7 +282,7 @@ pub enum Field<'a> {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RawField<'a> {
     pub name: FlatCow<'a, str>,
-    pub value: Box<[FlatCow<'a, ByteStr>]>,
+    pub value: Vec<FlatCow<'a, ByteStr>>,
 }
 
 ///
@@ -253,12 +294,12 @@ pub struct RawField<'a> {
 /// parameter-name  = token
 /// parameter-value = ( token / quoted-string )
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Parameters<'a> {
-    value: HashMap<FlatCow<'a, str>, Vec<ParameterValue<'a>>>,
+    value: HashMap<FlatCow<'a, str>, ParameterValue<'a>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum ParameterValue<'a> {
     Token(FlatCow<'a, str>),
     QStr(FlatCow<'a, ByteStr>),
@@ -271,13 +312,13 @@ pub enum SingletonFieldValue<'a> {
     Oth(FlatCow<'a, [u8]>),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct MediaType<'a> {
     mime: mime::MediaType,
     parameters: Parameters<'a>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct MediaRange<'a> {
     pub mime: mime::MediaRangeType,
     pub parameters: Parameters<'a>,
@@ -294,7 +335,7 @@ pub struct MediaRange<'a> {
 /// any media type parameter having the same name. Hence,
 /// the media type registry disallows parameters named "q".
 ///
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Accept<'a> {
     pub values: Vec<(MediaRange<'a>, f32)>,
 }
@@ -304,31 +345,94 @@ pub struct AcceptCharset {
     pub values: Vec<(Charset, f32)>,
 }
 
+pub struct Connection;
+
 pub enum Charset {
     Spec(charset::Charset),
     Star,
 }
 
-pub struct ContentType<'a> {
-    pub value: MediaType<'a>,
-}
+pub type ContentType<'a> = MediaType<'a>;
 
 pub struct ContentLength {
     pub value: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct ContentEncoding {
-    value: ContentCoding,
+    pub value: Vec<ContentCoding>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ContentCoding {
-    GZip,
-    Deflate,
-    Compress,
-    /// no encoding
-    Identity,
+///
+///
+/// ```ABNF
+/// transfer-coding    = token *( OWS ";" OWS transfer-parameter )
+/// transfer-parameter = token BWS "=" BWS ( token / quoted-string )
+/// ```
+///
+#[derive(Debug)]
+pub struct TransferEncoding<'a> {
+    pub value: Vec<TransferCoding<'a>>,
+}
+
+#[derive(Debug)]
+pub struct TransferCoding<'a> {
+    pub coding: parameters::TransferCoding,
+    pub parameters: Parameters<'a>,
+}
+
+pub mod parameters {
+    use strum::EnumString;
+
+    ///
+    /// According to [IANA Hypertext Transfer Protocol (HTTP) Parameters
+    /// ](https://www.iana.org/assignments/http-parameters/http-parameters.xhtml)
+    ///
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, EnumString)]
+    #[strum(ascii_case_insensitive)]
+    pub enum ContentCoding {
+        /// AES-GCM encryption with a 128-bit content encryption key
+        AES128GCM,
+        /// Brotli Compressed Data Format
+        Br,
+        /// UNIX "compress" data format
+        Compress,
+        /// "Dictionary-Compressed Brotli" data format
+        DCB,
+        /// "Dictionary-Compressed Zstandard" data format
+        DCZ,
+        /// "deflate" compressed data ([RFC1951]) inside the "zlib" data format
+        Deflate,
+        /// W3C Efficient XML Interchange
+        EXI,
+        Gzip,
+        /// "no encoding", identity(x) = x
+        Identity,
+        /// Network Transfer Format for Java Archives
+        #[strum(serialize = "pack200-gzip")]
+        Pack200GZip,
+        /// A stream of bytes compressed using the Zstandard protocol
+        /// with a Window_Size of not more than 8 MB.
+        Zstd,
+    }
+
+    ///
+    /// According to [IANA Hypertext Transfer Protocol (HTTP) Parameters
+    /// ](https://www.iana.org/assignments/http-parameters/http-parameters.xhtml)
+    ///
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, EnumString)]
+    #[strum(ascii_case_insensitive)]
+    pub enum TransferCoding {
+        /// Transfer in a series of chunks
+        Chunked,
+        /// UNIX "compress" data format
+        Compress,
+        Deflate,
+        Gzip,
+        Identity,
+        /// reserved
+        Trailers,
+    }
 }
 
 ///
@@ -445,8 +549,50 @@ pub struct Product<'a> {
 ////////////////////////////////////////////////////////////////////////////////
 //// Implementations
 
+impl<'a> MessageHeader<'a> {
+    pub fn fileds_mut(&mut self) -> &mut Fields<'a> {
+        use MessageHeader::*;
+
+        match self {
+            RequestHeader(header) => &mut header.fields,
+            ResponseHeader(header) => &mut header.fields,
+        }
+    }
+}
+
+impl<'a> Message<'a> {
+    pub fn from_parts(
+        header: MessageHeader<'a>,
+        body: FlatCow<'a, ByteStr>,
+        trailer: Option<Fields<'a>>,
+    ) -> Self {
+        use MessageHeader::*;
+
+        match header {
+            RequestHeader(header) => Self::Request(Request {
+                method: header.method,
+                target: header.target,
+                version: header.version,
+                fields: header.fields,
+                body,
+                trailer
+            }),
+            ResponseHeader(header) => {
+                Self::Response(Response {
+                    version: header.version,
+                    status: header.status,
+                    reason: header.reason,
+                    fields: header.fields,
+                    body,
+                    trailer
+                })
+            }
+        }
+    }
+}
+
 impl StatusCode {
-    pub fn reason(&self) -> Box<str> {
+    pub fn reason(&self) -> &str {
         use StatusCode::*;
 
         match self {
@@ -497,16 +643,10 @@ impl StatusCode {
             GatewayTimeout => "Gateway Timeout",
             HTTPVersionNotSupported => "HTTP Version Not Supported",
         }
-        .to_string()
-        .into_boxed_str()
     }
 }
 
 impl<'a> Fields<'a> {
-    pub fn iter(&self) -> impl Iterator<Item = &Field<'a>> {
-        self.fields.iter()
-    }
-
     pub fn host(&self) -> Option<&Host<'a>> {
         self.fields
             .iter()
@@ -518,6 +658,28 @@ impl<'a> Fields<'a> {
                 };
                 host
             })
+    }
+}
+
+impl<'a> Deref for Fields<'a> {
+    type Target = [Field<'a>];
+
+    fn deref(&self) -> &Self::Target {
+        &self.fields
+    }
+}
+
+impl Display for Connection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "close")
+    }
+}
+
+impl Deref for ContentEncoding {
+    type Target = [ContentCoding];
+
+    fn deref(&self) -> &Self::Target {
+        &self.value
     }
 }
 
@@ -785,12 +947,15 @@ impl<'a> Field<'a> {
 
         match self {
             Self::Host(..) => Host,
+            Self::Connection => Connection,
             Self::ContentType(..) => ContentType,
+            Self::ContentEncoding(..) => ContentEncoding,
+            Self::TransferEncoding(..) => TransferEncoding,
             Self::Accept(..) => Accept,
             Self::Server(..) => Server,
             Self::Date(..) => Date,
-            Self::NonSandard(RawField { name, .. }) => {
-                NonSandard(name.to_string().into_boxed_str())
+            Self::NonStandard(RawField { name, .. }) => {
+                NonStandard(name.to_string().into_boxed_str())
             }
         }
     }
@@ -839,7 +1004,16 @@ impl RequestTarget {
         }
     }
 
-    pub fn query(&self) {}
+    pub fn query(&self) -> Option<&str> {
+        use RequestTarget::*;
+
+        match self {
+            Origin { query, .. } => query.as_ref().map(|s| s.deref()),
+            Absolute { uri } => uri.query(),
+            Authority { .. } => None,
+            Asterisk => None,
+        }
+    }
 }
 
 impl<'a> FromStr for Host<'a> {
@@ -895,7 +1069,16 @@ impl FromStr for RequestTarget {
     }
 }
 
+impl<'a> Response<'a> {
+    /// Builder mode
+    pub fn field(self, filed: Field<'a>) -> Self {
+        let mut mut_self = self;
 
+        mut_self.fields.fields.push(filed);
+
+        mut_self
+    }
+}
 
 
 #[cfg(test)]
@@ -919,12 +1102,12 @@ mod tests {
         );
         assert_eq!(
             "ABC".to_owned(),
-            FieldName::NonSandard("ABC".to_owned().into_boxed_str())
+            FieldName::NonStandard("ABC".to_owned().into_boxed_str())
                 .to_string()
         );
         assert_eq!(
             "ABC".parse::<FieldName>().unwrap(),
-            FieldName::NonSandard("ABC".to_owned().into_boxed_str())
+            FieldName::NonStandard("ABC".to_owned().into_boxed_str())
         );
     }
 
