@@ -28,9 +28,9 @@ pub struct ResponseBuf {
     pub version: Version,
     pub status: StatusCode,
     pub reason: Option<String>,
-    pub fields: FieldsBuf,
+    pub fields: Fields,
     pub body: ByteString,
-    pub trailers: Option<FieldsBuf>
+    pub trailers: Option<Fields>
 }
 
 pub struct FieldsBuf {
@@ -251,7 +251,7 @@ impl ToString for Date {
 /////////////////////////////////////////
 //// implement From references
 
-impl From<Parameters<'_>> for ParametersBuf {
+impl From<Parameters> for ParametersBuf {
     fn from(value: Parameters) -> Self {
         let mut inner_parameters = HashMap::new();
 
@@ -265,19 +265,19 @@ impl From<Parameters<'_>> for ParametersBuf {
     }
 }
 
-impl From<ParameterValue<'_>> for ParameterValueBuf {
-    fn from(value: ParameterValue<'_>) -> Self {
+impl From<ParameterValue> for ParameterValueBuf {
+    fn from(value: ParameterValue) -> Self {
         match value {
             ParameterValue::Token(value) => Self::Token(value.to_string()),
             ParameterValue::QStr(value) => {
-                Self::QStr(value.as_bytestr().to_owned())
+                Self::QStr(value)
             }
         }
     }
 }
 
-impl From<MediaType<'_>> for MediaTypeBuf {
-    fn from(value: MediaType<'_>) -> Self {
+impl From<MediaType> for MediaTypeBuf {
+    fn from(value: MediaType) -> Self {
         Self {
             mime: value.mime,
             parameters: value.parameters.into(),

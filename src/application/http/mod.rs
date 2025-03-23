@@ -9,7 +9,7 @@ use std::{
 };
 
 use chrono::{DateTime, Datelike, TimeZone, Timelike, Weekday};
-use m6ptr::ByteStr;
+use m6ptr::{ByteStr, ByteString};
 pub use m6ptr::FlatCow;
 use m6tobytes::{derive_from_bits, derive_to_bits};
 use parameters::ContentCoding;
@@ -43,9 +43,9 @@ pub struct Request<'a> {
     pub method: Method,
     pub target: RequestTarget,
     pub version: Version,
-    pub fields: Fields<'a>,
-    pub body: FlatCow<'a, ByteStr>,
-    pub trailer: Option<Fields<'a>>
+    pub fields: Fields,
+    pub body: &'a ByteStr,
+    pub trailer: Option<Fields>
 }
 
 #[derive(Debug)]
@@ -53,31 +53,31 @@ pub struct Response<'a> {
     pub version: Version,
     pub status: StatusCode,
     pub reason: Option<Box<str>>,
-    pub fields: Fields<'a>,
-    pub body: FlatCow<'a, ByteStr>,
-    pub trailer: Option<Fields<'a>>
+    pub fields: Fields,
+    pub body: &'a ByteStr,
+    pub trailer: Option<Fields>
 }
 
 #[derive(Debug)]
-pub enum MessageHeader<'a> {
-    RequestHeader(RequestHeader<'a>),
-    ResponseHeader(ResponseHeader<'a>),
+pub enum MessageHeader {
+    RequestHeader(RequestHeader),
+    ResponseHeader(ResponseHeader),
 }
 
 #[derive(Debug)]
-pub struct RequestHeader<'a> {
+pub struct RequestHeader {
     pub method: Method,
     pub target: RequestTarget,
     pub version: Version,
-    pub fields: Fields<'a>,
+    pub fields: Fields,
 }
 
 #[derive(Debug)]
-pub struct ResponseHeader<'a> {
+pub struct ResponseHeader {
     pub version: Version,
     pub status: StatusCode,
     pub reason: Option<Box<str>>,
-    pub fields: Fields<'a>,
+    pub fields: Fields,
 }
 
 /// case-sensitive
@@ -226,8 +226,8 @@ pub enum StatusCode {
 }
 
 #[derive(Debug)]
-pub struct Fields<'a> {
-    pub fields: Vec<Field<'a>>,
+pub struct Fields {
+    pub fields: Vec<Field>,
 }
 
 #[derive(
@@ -256,23 +256,23 @@ pub enum FieldName {
 }
 
 #[derive(Debug)]
-pub struct Host<'a> {
-    pub host: FlatCow<'a, str>,
+pub struct Host {
+    pub host: String,
     pub port: Option<u16>,
 }
 
 #[derive(Debug)]
-pub enum Field<'a> {
-    Accept(Accept<'a>),
+pub enum Field {
+    Accept(Accept),
     /// Connection: close
     Connection,
-    ContentType(MediaType<'a>),
+    ContentType(MediaType),
     ContentEncoding(ContentEncoding),
     Date(Date),
-    Host(Host<'a>),
-    Server(Server<'a>),
-    TransferEncoding(TransferEncoding<'a>),
-    NonStandard(RawField<'a>),
+    Host(Host),
+    Server(Server),
+    TransferEncoding(TransferEncoding),
+    NonStandard(RawField),
 }
 
 /// derive trait `Ord` based on
@@ -280,9 +280,9 @@ pub enum Field<'a> {
 /// (https://doc.rust-lang.org/std/cmp/trait.Ord.html#derivable)
 /// which is name here.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct RawField<'a> {
-    pub name: FlatCow<'a, str>,
-    pub value: Vec<FlatCow<'a, ByteStr>>,
+pub struct RawField {
+    pub name: String,
+    pub value: Vec<ByteString>,
 }
 
 ///
@@ -295,33 +295,33 @@ pub struct RawField<'a> {
 /// parameter-value = ( token / quoted-string )
 /// ```
 #[derive(Debug, PartialEq, Eq)]
-pub struct Parameters<'a> {
-    value: HashMap<FlatCow<'a, str>, ParameterValue<'a>>,
+pub struct Parameters {
+    value: HashMap<String, ParameterValue>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub enum ParameterValue<'a> {
-    Token(FlatCow<'a, str>),
-    QStr(FlatCow<'a, ByteStr>),
+pub enum ParameterValue {
+    Token(String),
+    QStr(ByteString),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SingletonFieldValue<'a> {
-    Token(FlatCow<'a, str>),
-    QStr(FlatCow<'a, [u8]>),
-    Oth(FlatCow<'a, [u8]>),
+pub enum SingletonFieldValue {
+    Token(String),
+    QStr(ByteString),
+    Oth(ByteString),
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub struct MediaType<'a> {
+pub struct MediaType {
     mime: mime::MediaType,
-    parameters: Parameters<'a>,
+    parameters: Parameters,
 }
 
 #[derive(Debug)]
-pub struct MediaRange<'a> {
+pub struct MediaRange {
     pub mime: mime::MediaRangeType,
-    pub parameters: Parameters<'a>,
+    pub parameters: Parameters,
 }
 
 ///
@@ -336,8 +336,8 @@ pub struct MediaRange<'a> {
 /// the media type registry disallows parameters named "q".
 ///
 #[derive(Debug)]
-pub struct Accept<'a> {
-    pub values: Vec<(MediaRange<'a>, f32)>,
+pub struct Accept {
+    pub values: Vec<(MediaRange, f32)>,
 }
 
 /// deprecated field (for utf-8 has become nearly ubiquitous)
@@ -352,7 +352,7 @@ pub enum Charset {
     Star,
 }
 
-pub type ContentType<'a> = MediaType<'a>;
+pub type ContentType = MediaType;
 
 pub struct ContentLength {
     pub value: u64,
@@ -371,14 +371,14 @@ pub struct ContentEncoding {
 /// ```
 ///
 #[derive(Debug)]
-pub struct TransferEncoding<'a> {
-    pub value: Vec<TransferCoding<'a>>,
+pub struct TransferEncoding {
+    pub value: Vec<TransferCoding>,
 }
 
 #[derive(Debug)]
-pub struct TransferCoding<'a> {
+pub struct TransferCoding {
     pub coding: parameters::TransferCoding,
-    pub parameters: Parameters<'a>,
+    pub parameters: Parameters,
 }
 
 pub mod parameters {
@@ -524,15 +524,15 @@ pub struct TimeOfDay {
 /// ```
 ///
 #[derive(Debug, Clone)]
-pub struct Server<'a> {
-    pub product: Product<'a>,
-    pub rem: Vec<ProductOrComment<'a>>,
+pub struct Server {
+    pub product: Product,
+    pub rem: Vec<ProductOrComment>,
 }
 
 #[derive(Debug, Clone)]
-pub enum ProductOrComment<'a> {
-    Product(Product<'a>),
-    Comment(FlatCow<'a, ByteStr>),
+pub enum ProductOrComment {
+    Product(Product),
+    Comment(ByteString),
 }
 
 ///
@@ -541,16 +541,16 @@ pub enum ProductOrComment<'a> {
 /// product-version = token
 /// ```
 #[derive(Debug, Clone)]
-pub struct Product<'a> {
-    pub name: FlatCow<'a, str>,
-    pub version: Option<FlatCow<'a, str>>,
+pub struct Product {
+    pub name: String,
+    pub version: Option<String>,
 }
 
 ////////////////////////////////////////////////////////////////////////////////
 //// Implementations
 
-impl<'a> MessageHeader<'a> {
-    pub fn fileds_mut(&mut self) -> &mut Fields<'a> {
+impl MessageHeader {
+    pub fn fileds_mut(&mut self) -> &mut Fields {
         use MessageHeader::*;
 
         match self {
@@ -562,9 +562,9 @@ impl<'a> MessageHeader<'a> {
 
 impl<'a> Message<'a> {
     pub fn from_parts(
-        header: MessageHeader<'a>,
-        body: FlatCow<'a, ByteStr>,
-        trailer: Option<Fields<'a>>,
+        header: MessageHeader,
+        body: &'a ByteStr,
+        trailer: Option<Fields>,
     ) -> Self {
         use MessageHeader::*;
 
@@ -646,8 +646,8 @@ impl StatusCode {
     }
 }
 
-impl<'a> Fields<'a> {
-    pub fn host(&self) -> Option<&Host<'a>> {
+impl Fields {
+    pub fn host(&self) -> Option<&Host> {
         self.fields
             .iter()
             .find(|field| matches!(field, Field::Host(..)))
@@ -661,8 +661,8 @@ impl<'a> Fields<'a> {
     }
 }
 
-impl<'a> Deref for Fields<'a> {
-    type Target = [Field<'a>];
+impl Deref for Fields {
+    type Target = [Field];
 
     fn deref(&self) -> &Self::Target {
         &self.fields
@@ -941,7 +941,7 @@ impl Display for TimeOfDay {
     }
 }
 
-impl<'a> Field<'a> {
+impl Field {
     pub fn name(&self) -> FieldName {
         use FieldName::*;
 
@@ -961,7 +961,7 @@ impl<'a> Field<'a> {
     }
 }
 
-impl<'a> Parameters<'a> {}
+impl Parameters {}
 
 impl TryFrom<u16> for StatusCode {
     type Error = Box<str>;
@@ -1016,7 +1016,7 @@ impl RequestTarget {
     }
 }
 
-impl<'a> FromStr for Host<'a> {
+impl FromStr for Host {
     type Err = Box<str>;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -1030,7 +1030,7 @@ impl<'a> FromStr for Host<'a> {
 
         //
         Ok(Self {
-            host: FlatCow::<str>::own_new(host.to_owned()),
+            host: host.to_owned(),
             port: url.port(),
         })
     }
@@ -1071,7 +1071,7 @@ impl FromStr for RequestTarget {
 
 impl<'a> Response<'a> {
     /// Builder mode
-    pub fn field(self, filed: Field<'a>) -> Self {
+    pub fn field(self, filed: Field) -> Self {
         let mut mut_self = self;
 
         mut_self.fields.fields.push(filed);
