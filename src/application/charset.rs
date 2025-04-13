@@ -18,4 +18,3 @@ pub enum Charset {
     #[strum(serialize = "gb18030", ascii_case_insensitive)]
     GB18030 = 114
 }
-

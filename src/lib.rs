@@ -4,6 +4,7 @@
 #![feature(iterator_try_collect)]
 #![feature(ascii_char_variants)]
 #![feature(ascii_char)]
+#![feature(trivial_bounds)]
 
 pub mod datalink;
 pub mod network;
