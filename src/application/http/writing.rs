@@ -256,7 +256,7 @@ impl WriteIntoBytes for Parameters {
     }
 }
 
-impl WriteIntoBytes for Pair {
+impl WriteIntoBytes for Parameter {
     fn write_into_bytes<W: Write>(&self, w: &mut W) -> std::io::Result<usize> {
         let mut n = 0;
 
@@ -268,11 +268,11 @@ impl WriteIntoBytes for Pair {
     }
 }
 
-impl WriteIntoBytes for PairValue {
+impl WriteIntoBytes for ParameterValue {
     fn write_into_bytes<W: Write>(&self, w: &mut W) -> std::io::Result<usize> {
         Ok(match self {
-            PairValue::Token(token) => token.write_into_bytes(w)?,
-            PairValue::QStr(byte_string) => {
+            ParameterValue::Token(token) => token.write_into_bytes(w)?,
+            ParameterValue::QStr(byte_string) => {
                 let mut n = QuotationMark.as_str().write_into_bytes(w)?;
                 let bstr = byte_string.as_bstr();
 

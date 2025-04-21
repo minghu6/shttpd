@@ -6,63 +6,47 @@
 
 use std::convert::Infallible;
 
-use nom::{
-    AsBytes, AsChar, Compare, FindToken, IResult, Input, Offset, Parser,
-    branch::alt,
-    bytes::{complete::take_while_m_n, tag},
-    character::{
-        char,
-        complete::{digit0, hex_digit1},
+use m6io::{
+    ALPHA, DIGIT,
+    nom::{
+        AsByte,
+        byte::{
+            alpha, byte, digit, digit1, hexdig, one_of,
+            satisfy,
+        },
+        empty, on_guard_many_m_n, on_guard_many0, on_guard_many1,
+        on_guard_opt, safe_as_str_parse, safe_to_opt_string, safe_to_string,
     },
-    combinator::{map, map_res, opt, recognize, success},
-    error::ParseError,
-    multi::{count, many_m_n, many0, many1},
+};
+use nom::{
+    AsBytes, Compare, IResult, Input, Offset, Parser,
+    branch::alt,
+    bytes::tag,
+    combinator::{complete, map, map_res, recognize},
+    multi::count,
 };
 use strum::{Display, EnumString};
 
 ////////////////////////////////////////////////////////////////////////////////
 //// Macros
 
-/// 0..=9
-macro_rules! DIGIT {
-    () => {
-        '0'..='9'
-    };
-}
-
-macro_rules! ALPHA {
-    () => {
-        'a'..='z' | 'A'..='Z'
-    };
-}
-
-macro_rules! HEXDIG {
-    () => {
-        DIGIT![] | 'A'..='F' | 'a'..='f'
-    };
-}
-
 macro_rules! UNRESERVED {
     () => {
-        ALPHA![] | DIGIT![] | '-' | '.' | '_' | '~'
+        ALPHA![] | DIGIT![] | b'-' | b'.' | b'_' | b'~'
     };
 }
 
 macro_rules! SUB_DELIMS {
     () => {
-        '!' | '$' | '&' | '\'' | '(' | ')' | '*' | '+' | ',' | ';' | '='
-    };
-}
-
-macro_rules! safe_decode {
-    ($bytes:expr) => {
-        unsafe { std::str::from_utf8_unchecked($bytes) }
+        b'!' | b'$' | b'&' | b'\'' | b'(' | b')' | b'*' | b'+' | b',' | b';' | b'='
     };
 }
 
 ////////////////////////////////////////////////////////////////////////////////
 //// Structures
 
+///
+/// There is overlap across four forms
 ///
 /// ```abnf
 /// request-target = origin-form
@@ -72,8 +56,8 @@ macro_rules! safe_decode {
 ///
 /// origin-form    = absolute-path [ "?" query ]
 /// absolute-form  = absolute-URI
-/// authority-form = authority
-/// asterisk-form  = "*"
+/// authority-form = authority  (CONNECTION)
+/// asterisk-form  = "*"        (OPTIONS)
 /// ```
 ///
 #[derive(Debug, Clone)]
@@ -159,6 +143,7 @@ pub enum Scheme {
     IRC,
     /// Used for referencing resources in peer-to-peer networks
     Magnet,
+    #[strum(serialize = "{0}", default)]
     Oth(String),
 }
 
@@ -184,17 +169,63 @@ pub struct URI {
     pub scheme: Scheme,
     pub hier_part: HierPart,
     pub query: Option<String>,
-    pub fragment: Option<String>
+    pub fragment: Option<String>,
 }
 
 
 ////////////////////////////////////////////////////////////////////////////////
 //// Implementations
 
+impl RequestTarget {
+    pub fn path(&self) -> Option<&str> {
+        use RequestTarget::*;
+
+        match self {
+            Origin { abs_path, .. } => Some(abs_path),
+            Absolute(absolute_uri) => absolute_uri.path(),
+            Authority { .. } | Asterisk => None,
+        }
+    }
+
+    pub fn query(&self) -> Option<&str> {
+        use RequestTarget::*;
+
+        match self {
+            Origin { query, .. } => query.as_deref(),
+            Absolute(absolute_uri) => absolute_uri.query(),
+            Authority { .. } | Asterisk => None,
+        }
+    }
+}
+
+impl AbsoluteURI {
+    pub fn path(&self) -> Option<&str> {
+        self.hier_part.path()
+    }
+
+    pub fn query(&self) -> Option<&str> {
+        self.query.as_deref()
+    }
+}
+
+impl HierPart {
+    pub fn path(&self) -> Option<&str> {
+        use HierPart::*;
+
+        match self {
+            AuthorityAbEmpPath { rel_path, .. } => rel_path.as_deref(),
+            AbsPath(abs_path) => Some(abs_path),
+            RelPath(rel_path) => Some(rel_path),
+            EmpPath => None,
+        }
+    }
+}
 
 ////////////////////////////////////////////////////////////////////////////////
 //// Functions
 
+///
+/// There is overlap across four forms
 ///
 /// ```abnf
 /// request-target = origin-form
@@ -212,18 +243,18 @@ pub fn request_target<I>(input: I) -> IResult<I, RequestTarget>
 where
     I: Input + Offset + AsBytes,
     for<'a> I: Compare<&'a str>,
-    I::Item: AsChar,
+    I::Item: AsByte,
 {
     use RequestTarget::*;
 
     alt((
-        map((absolute_path, opt(query)), |(abs_path, query)| Origin {
-            abs_path,
-            query,
+        map(byte(b'*'), |_| Asterisk),
+        map((absolute_path, on_guard_opt(query)), |(abs_path, query)| {
+            Origin { abs_path, query }
         }),
-        map(absolute_uri, |s| Absolute(s)),
+        // complete distinguish
+        complete(map(absolute_uri, |s| Absolute(s))),
         map(authority, |au| Authority(au)),
-        map(char('*'), |_| Asterisk),
     ))
     .parse(input)
 }
@@ -237,9 +268,13 @@ pub fn absolute_path<I>(input: I) -> IResult<I, String>
 where
     I: Input + Offset + AsBytes,
     for<'a> I: Compare<&'a str>,
-    I::Item: AsChar,
+    I::Item: AsByte,
 {
-    map(recognize(many1((char('/'), segment))), to_string).parse(input)
+    map(
+        recognize(on_guard_many1((byte(b'/'), segment))),
+        safe_to_string,
+    )
+    .parse(input)
 }
 
 ///
@@ -251,20 +286,23 @@ pub fn uri<I>(input: I) -> IResult<I, URI>
 where
     I: Input + Offset + AsBytes,
     for<'a> I: Compare<&'a str>,
-    I::Item: AsChar,
+    I::Item: AsByte,
 {
-    map((
-        scheme,
-        char(':'),
-        hier_part,
-        opt((char('?'), query)),
-        opt((char('#'), fragment)),
-    ), |(scheme, _, hier_part, opt_q, opt_f)| URI {
-        scheme,
-        hier_part,
-        query: opt_q.map(|(_, q)| q),
-        fragment: opt_f.map(|(_, f)| f),
-    })
+    map(
+        (
+            scheme,
+            byte(b':'),
+            hier_part,
+            on_guard_opt((byte(b'?'), query)),
+            on_guard_opt((byte(b'#'), fragment)),
+        ),
+        |(scheme, _, hier_part, opt_q, opt_f)| URI {
+            scheme,
+            hier_part,
+            query: opt_q.map(|(_, q)| q),
+            fragment: opt_f.map(|(_, f)| f),
+        },
+    )
     .parse(input)
 }
 
@@ -282,7 +320,7 @@ pub fn hier_part<I>(input: I) -> IResult<I, HierPart>
 where
     I: Input + Offset + AsBytes,
     for<'a> I: Compare<&'a str>,
-    I::Item: AsChar,
+    I::Item: AsByte,
 {
     use HierPart::*;
 
@@ -314,14 +352,19 @@ pub fn absolute_uri<I>(input: I) -> IResult<I, AbsoluteURI>
 where
     I: Input + Offset + AsBytes,
     for<'a> I: Compare<&'a str>,
-    I::Item: AsChar,
+    I::Item: AsByte,
 {
     map(
-        (scheme, char(':'), hier_part, opt((char('?'), query))),
-        |(scheme, _, hier_part, opt)| AbsoluteURI {
+        (
+            scheme,
+            byte(b':'),
+            hier_part,
+            on_guard_opt((byte(b'?'), query)),
+        ),
+        |(scheme, _, hier_part, opt_q)| AbsoluteURI {
             scheme,
             hier_part,
-            query: opt.map(|(_, q)| q),
+            query: opt_q.map(|(_, q)| q),
         },
     )
     .parse(input)
@@ -336,12 +379,12 @@ pub fn relative_ref<I>(input: I) -> IResult<I, I>
 where
     I: Input + Offset + AsBytes,
     for<'a> I: Compare<&'a str>,
-    I::Item: AsChar,
+    I::Item: AsByte,
 {
     recognize((
         relative_part,
-        opt((char('?'), query)),
-        opt((char('#'), fragment)),
+        on_guard_opt((byte(b'?'), query)),
+        on_guard_opt((byte(b'#'), fragment)),
     ))
     .parse(input)
 }
@@ -358,7 +401,7 @@ pub fn relative_part<I>(input: I) -> IResult<I, I>
 where
     I: Input + Offset + AsBytes,
     for<'a> I: Compare<&'a str>,
-    I::Item: AsChar,
+    I::Item: AsByte,
 {
     alt((
         recognize((tag("//"), authority, path_abempty)),
@@ -377,14 +420,17 @@ where
 pub fn scheme<I>(input: I) -> IResult<I, Scheme>
 where
     I: Input + Offset + AsBytes,
-    I::Item: AsChar,
+    I::Item: AsByte,
 {
-    let (i, o) =
-        recognize((alpha, many0(alt((alpha, digit, take_one_of("+-."))))))
-            .parse(input)?;
-
-    // scheme has sentinel for unknown name so parse never fail
-    Ok((i, safe_decode!(o.as_bytes()).parse().unwrap()))
+    map(
+        recognize((
+            alpha,
+            on_guard_many0(alt((alpha, digit, one_of("+-.")))),
+        )),
+        // scheme has sentinel for unknown name so parse never fail
+        |s| safe_as_str_parse(s).unwrap(),
+    )
+    .parse(input)
 }
 
 ///
@@ -397,40 +443,39 @@ pub fn authority<I>(input: I) -> IResult<I, Authority>
 where
     I: Input + Offset + AsBytes,
     for<'a> I: Compare<&'a str>,
-    I::Item: AsChar,
+    I::Item: AsByte,
 {
-    let (input, (userinfo, host, port)) =
-        (opt((userinfo, char('@'))), host, opt((char(':'), port)))
-            .parse(input)?;
-
-    Ok((
-        input,
-        Authority {
-            userinfo: userinfo
-                .map(|(s, _)| safe_decode!(s.as_bytes()).to_owned()),
-            host: safe_decode!(host.as_bytes()).to_owned(),
+    map(
+        (
+            on_guard_opt(complete((userinfo::<I>, byte(b'@')))),
+            host,
+            on_guard_opt(complete((byte(b':'), port))),
+        ),
+        |(userinfo, host, port)| Authority {
+            userinfo: userinfo.map(|(s, _)| safe_to_string(s)),
+            host,
             port: port.map(|(_, p)| p),
         },
-    ))
+    )
+    .parse(input)
 }
 
 ///
 /// ```abnf
-/// authority = [ userinfo "@" ] host [ ":" port ]
-///
+/// userinfo = *( unreserved / pct-encoded / sub-delims / ":" )
 /// ```
 ///
 pub fn userinfo<I>(input: I) -> IResult<I, I>
 where
-    I: Input + Offset + AsBytes,
+    I: Input + Offset,
     for<'a> I: Compare<&'a str>,
-    I::Item: AsChar,
+    I::Item: AsByte,
 {
-    recognize(many0(alt((
+    recognize(on_guard_many0(alt((
         unreserved,
         pct_encoded,
         sub_delims,
-        take_one(':'),
+        recognize(byte(b':')),
     ))))
     .parse(input)
 }
@@ -440,13 +485,13 @@ where
 /// host = IP-literal / IPv4address / reg-name
 /// ```
 ///
-pub fn host<I>(input: I) -> IResult<I, I>
+pub fn host<I>(input: I) -> IResult<I, String>
 where
     I: Input + Offset + AsBytes,
     for<'a> I: Compare<&'a str>,
-    I::Item: AsChar,
+    I::Item: AsByte,
 {
-    alt((ip_literal, ipv4address, reg_name)).parse(input)
+    map(alt((ip_literal, ipv4address, reg_name)), safe_to_string).parse(input)
 }
 
 ///
@@ -461,9 +506,9 @@ pub fn port<I>(input: I) -> IResult<I, u16>
 where
     I: Input + Offset + AsBytes,
     for<'a> I: Compare<&'a str>,
-    I::Item: AsChar,
+    I::Item: AsByte,
 {
-    map_res(digit0, |s: I| safe_decode!(s.as_bytes()).parse()).parse(input)
+    map_res(digit1, |s: I| safe_as_str_parse(s)).parse(input)
 }
 
 ///
@@ -473,11 +518,11 @@ where
 ///
 pub fn ip_literal<I>(input: I) -> IResult<I, I>
 where
-    I: Input + Offset + AsBytes,
+    I: Input + Offset,
     for<'a> I: Compare<&'a str>,
-    I::Item: AsChar,
+    I::Item: AsByte,
 {
-    recognize((char('['), alt((ipv6address, ip_vfuture)), char(']')))
+    recognize((byte(b'['), alt((ipv6address, ip_vfuture)), byte(b']')))
         .parse(input)
 }
 
@@ -488,14 +533,14 @@ where
 ///
 pub fn ip_vfuture<I>(input: I) -> IResult<I, I>
 where
-    I: Input + Offset + AsBytes,
-    I::Item: AsChar,
+    I: Input + Offset,
+    I::Item: AsByte,
 {
     recognize((
-        char('v'),
-        hex_digit1,
-        char('.'),
-        many1((unreserved, sub_delims, char(':'))),
+        byte(b'v'),
+        on_guard_many1(hexdig),
+        byte(b'.'),
+        on_guard_many1((unreserved, sub_delims, byte(b':'))),
     ))
     .parse(input)
 }
@@ -515,35 +560,48 @@ where
 ///
 pub fn ipv6address<I>(input: I) -> IResult<I, I>
 where
-    I: Input + Offset + AsBytes,
+    I: Input + Offset,
     for<'a> I: Compare<&'a str>,
-    I::Item: AsChar,
+    I::Item: AsByte,
 {
     recognize(alt((
-        recognize((count((h16, char(':')), 6), ones32)),
-        recognize((tag("::"), count((h16, char(':')), 5), ones32)),
-        recognize((opt(h16), tag("::"), count((h16, char(':')), 4), ones32)),
+        recognize((count((h16, byte(b':')), 6), ones32)),
+        recognize((tag("::"), count((h16, byte(b':')), 5), ones32)),
         recognize((
-            opt(many_m_n(0, 1, h16)),
+            on_guard_opt(h16),
             tag("::"),
-            count((h16, char(':')), 3),
+            count((h16, byte(b':')), 4),
             ones32,
         )),
         recognize((
-            opt(many_m_n(0, 2, h16)),
+            on_guard_opt(on_guard_many_m_n(0, 1, h16)),
             tag("::"),
-            count((h16, char(':')), 2),
+            count((h16, byte(b':')), 3),
             ones32,
         )),
         recognize((
-            opt(many_m_n(0, 3, h16)),
+            on_guard_opt(on_guard_many_m_n(0, 2, h16)),
             tag("::"),
-            (h16, char(':')),
+            count((h16, byte(b':')), 2),
             ones32,
         )),
-        recognize((opt(many_m_n(0, 4, h16)), tag("::"), ones32)),
-        recognize((opt(many_m_n(0, 5, h16)), tag("::"), h16)),
-        recognize((opt(many_m_n(0, 6, h16)), tag("::"))),
+        recognize((
+            on_guard_opt(on_guard_many_m_n(0, 3, h16)),
+            tag("::"),
+            (h16, byte(b':')),
+            ones32,
+        )),
+        recognize((
+            on_guard_opt(on_guard_many_m_n(0, 4, h16)),
+            tag("::"),
+            ones32,
+        )),
+        recognize((
+            on_guard_opt(on_guard_many_m_n(0, 5, h16)),
+            tag("::"),
+            h16,
+        )),
+        recognize((on_guard_opt(on_guard_many_m_n(0, 6, h16)), tag("::"))),
     )))
     .parse(input)
 }
@@ -555,11 +613,11 @@ where
 ///
 pub fn h16<I>(input: I) -> IResult<I, I>
 where
-    I: Input + Offset + AsBytes,
-    I::Item: AsChar,
+    I: Input + Offset,
+    I::Item: AsByte,
 {
     // m <= len <= n).
-    recognize(take_while_m_n(1, 4, is_hexdig)).parse(input)
+    recognize(on_guard_many_m_n(1, 4, hexdig)).parse(input)
 }
 
 ///
@@ -569,12 +627,12 @@ where
 ///
 pub fn ones32<I>(input: I) -> IResult<I, I>
 where
-    I: Input + Offset + AsBytes,
+    I: Input + Offset,
     for<'a> I: Compare<&'a str>,
-    I::Item: AsChar,
+    I::Item: AsByte,
 {
     // m <= len <= n).
-    recognize(alt((recognize((h16, char(':'), h16)), ipv4address)))
+    recognize(alt((recognize((h16, byte(b':'), h16)), ipv4address)))
         .parse(input)
 }
 
@@ -585,18 +643,18 @@ where
 ///
 pub fn ipv4address<I>(input: I) -> IResult<I, I>
 where
-    I: Input + Offset + AsBytes,
+    I: Input + Offset,
     for<'a> I: Compare<&'a str>,
-    I::Item: AsChar,
+    I::Item: AsByte,
 {
     // m <= len <= n).
     recognize((
         dec_octet,
-        char('.'),
+        byte(b'.'),
         dec_octet,
-        char('.'),
+        byte(b'.'),
         dec_octet,
-        char('.'),
+        byte(b'.'),
         dec_octet,
     ))
     .parse(input)
@@ -615,17 +673,17 @@ where
 ///
 pub fn dec_octet<I>(input: I) -> IResult<I, I>
 where
-    I: Input + Offset + AsBytes,
+    I: Input + Offset,
     for<'a> I: Compare<&'a str>,
-    I::Item: AsChar,
+    I::Item: AsByte,
 {
     // m <= len <= n).
     recognize(alt((
-        digit,
-        recognize((take_one_of("123456789"), digit)),
-        recognize((char('1'), digit, digit)),
-        recognize((char('2'), take_one_of("01234"), digit)),
-        recognize((tag("25"), take_one_of("012345"))),
+        recognize(digit),
+        recognize((one_of("123456789"), digit)),
+        recognize((byte(b'1'), digit, digit)),
+        recognize((byte(b'2'), one_of("01234"), digit)),
+        recognize((tag("25"), one_of("012345"))),
     )))
     .parse(input)
 }
@@ -639,11 +697,12 @@ where
 ///
 pub fn reg_name<I>(input: I) -> IResult<I, I>
 where
-    I: Input + Offset + AsBytes,
+    I: Input + Offset,
     for<'a> I: Compare<&'a str>,
-    I::Item: AsChar,
+    I::Item: AsByte,
 {
-    recognize(many0((unreserved, pct_encoded, sub_delims))).parse(input)
+    recognize(on_guard_many0(alt((unreserved, pct_encoded, sub_delims))))
+        .parse(input)
 }
 
 ///
@@ -661,9 +720,13 @@ where
 pub fn path_abempty<I>(input: I) -> IResult<I, Option<String>>
 where
     I: Input + Offset + AsBytes,
-    I::Item: AsChar,
+    I::Item: AsByte,
 {
-    map(recognize(many0((char('/'), segment))), to_opt_string).parse(input)
+    map(
+        recognize(on_guard_many0((byte(b'/'), segment))),
+        safe_to_opt_string,
+    )
+    .parse(input)
 }
 
 ///
@@ -676,11 +739,14 @@ where
 pub fn path_absolute<I>(input: I) -> IResult<I, String>
 where
     I: Input + Offset + AsBytes,
-    I::Item: AsChar,
+    I::Item: AsByte,
 {
     map(
-        recognize((char('/'), opt((segment_nz, many0((char('/'), segment)))))),
-        to_string,
+        recognize((
+            byte(b'/'),
+            on_guard_opt((segment_nz, on_guard_many0((byte(b'/'), segment)))),
+        )),
+        safe_to_string,
     )
     .parse(input)
 }
@@ -694,10 +760,11 @@ where
 ///
 pub fn path_noscheme<I>(input: I) -> IResult<I, I>
 where
-    I: Input + Offset + AsBytes,
-    I::Item: AsChar,
+    I: Input + Offset,
+    I::Item: AsByte,
 {
-    recognize((segment_nz_nc, many0((char('/'), segment)))).parse(input)
+    recognize((segment_nz_nc, on_guard_many0((byte(b'/'), segment))))
+        .parse(input)
 }
 
 ///
@@ -710,11 +777,11 @@ where
 pub fn path_rootless<I>(input: I) -> IResult<I, String>
 where
     I: Input + Offset + AsBytes,
-    I::Item: AsChar,
+    I::Item: AsByte,
 {
     map(
-        recognize((segment_nz, many0((char('/'), segment)))),
-        to_string,
+        recognize((segment_nz, on_guard_many0((byte(b'/'), segment)))),
+        safe_to_string,
     )
     .parse(input)
 }
@@ -728,8 +795,7 @@ where
 ///
 pub fn path_empty<I>(input: I) -> IResult<I, I>
 where
-    I: Input + Offset + AsBytes,
-    I::Item: AsChar,
+    I: Input + Offset,
 {
     empty(input)
 }
@@ -743,10 +809,10 @@ where
 ///
 pub fn segment<I>(input: I) -> IResult<I, I>
 where
-    I: Input + Offset + AsBytes,
-    I::Item: AsChar,
+    I: Input + Offset,
+    I::Item: AsByte,
 {
-    recognize(many0(pchar)).parse(input)
+    recognize(on_guard_many0(pchar)).parse(input)
 }
 
 ///
@@ -758,10 +824,10 @@ where
 ///
 pub fn segment_nz<I>(input: I) -> IResult<I, I>
 where
-    I: Input + Offset + AsBytes,
-    I::Item: AsChar,
+    I: Input + Offset,
+    I::Item: AsByte,
 {
-    recognize(many1(pchar)).parse(input)
+    recognize(on_guard_many1(pchar)).parse(input)
 }
 
 ///
@@ -773,14 +839,14 @@ where
 ///
 pub fn segment_nz_nc<I>(input: I) -> IResult<I, I>
 where
-    I: Input + Offset + AsBytes,
-    I::Item: AsChar,
+    I: Input + Offset,
+    I::Item: AsByte,
 {
-    recognize(many1(alt((
+    recognize(on_guard_many1(alt((
         unreserved,
         pct_encoded,
         sub_delims,
-        take_one_of("@"),
+        recognize(one_of("@")),
     ))))
     .parse(input)
 }
@@ -792,7 +858,7 @@ where
 pub fn fragment<I>(input: I) -> IResult<I, String>
 where
     I: Input + Offset + AsBytes,
-    I::Item: AsChar,
+    I::Item: AsByte,
 {
     query(input)
 }
@@ -801,24 +867,30 @@ where
 /// ```abnf
 /// query = *( pchar / "/" / "?" )
 /// ```
+///
+/// actually no empty
+///
 pub fn query<I>(input: I) -> IResult<I, String>
 where
     I: Input + Offset + AsBytes,
-    I::Item: AsChar,
+    I::Item: AsByte,
 {
-    map(recognize(many0(alt((pchar, take_one_of("/?"))))), to_string)
-        .parse(input)
+    map(
+        recognize(on_guard_many1(alt((pchar, recognize(one_of("/?")))))),
+        safe_to_string,
+    )
+    .parse(input)
 }
 
 /// ```abnf
-///   pct-encoded   = "%" HEXDIG HEXDIG
+/// pct-encoded = "%" HEXDIG HEXDIG
 /// ```
 pub fn pct_encoded<I>(input: I) -> IResult<I, I>
 where
-    I: Input + Offset + AsBytes,
-    I::Item: AsChar,
+    I: Input + Offset,
+    I::Item: AsByte,
 {
-    recognize((char('%'), take_while_just_n(2, is_hexdig))).parse(input)
+    recognize((byte(b'%'), hexdig, hexdig)).parse(input)
 }
 
 ///
@@ -827,10 +899,16 @@ where
 /// ```
 pub fn pchar<I>(input: I) -> IResult<I, I>
 where
-    I: Input + Offset + AsBytes,
-    I::Item: AsChar,
+    I: Input + Offset,
+    I::Item: AsByte,
 {
-    alt((unreserved, pct_encoded, sub_delims, take_one_of(":@"))).parse(input)
+    alt((
+        unreserved,
+        pct_encoded,
+        sub_delims,
+        recognize(one_of(*b":@")),
+    ))
+    .parse(input)
 }
 
 /// ```abnf
@@ -838,10 +916,10 @@ where
 /// ```
 pub fn unreserved<I>(input: I) -> IResult<I, I>
 where
-    I: Input + Offset + AsBytes,
-    I::Item: AsChar,
+    I: Input + Offset,
+    I::Item: AsByte,
 {
-    take_while_just_n(1, is_unreserved).parse(input)
+    recognize(satisfy(is_unreserved)).parse(input)
 }
 
 /// ```abnf
@@ -850,128 +928,43 @@ where
 /// ```
 pub fn sub_delims<I>(input: I) -> IResult<I, I>
 where
-    I: Input + Offset + AsBytes,
-    I::Item: AsChar,
-{
-    take_while_just_n(1, is_sub_delims).parse(input)
-}
-
-pub fn alpha<I>(input: I) -> IResult<I, I>
-where
-    I: Input + Offset + AsBytes,
-    I::Item: AsChar,
-{
-    take_while_just_n(1, is_alpha).parse(input)
-}
-
-pub fn digit<I>(input: I) -> IResult<I, I>
-where
-    I: Input + Offset + AsBytes,
-    I::Item: AsChar,
-{
-    take_while_just_n(1, is_digit).parse(input)
-}
-
-
-////////////////////////////////////////
-//// Is Functions
-
-pub fn is_unreserved<Ch: AsChar>(b: Ch) -> bool {
-    matches!(b.as_char(), UNRESERVED![])
-}
-
-pub fn is_hexdig<Ch: AsChar>(b: Ch) -> bool {
-    matches!(b.as_char(), HEXDIG![])
-}
-
-pub fn is_sub_delims<Ch: AsChar>(b: Ch) -> bool {
-    matches!(b.as_char(), SUB_DELIMS![])
-}
-
-pub fn is_alpha<Ch: AsChar>(b: Ch) -> bool {
-    matches!(b.as_char(), ALPHA![])
-}
-
-pub fn is_digit<Ch: AsChar>(b: Ch) -> bool {
-    matches!(b.as_char(), DIGIT![])
-}
-
-////////////////////////////////////////
-//// Common Functions
-
-pub fn take_while_just_n<F, I, E: ParseError<I>>(
-    n: usize,
-    cond: F,
-) -> impl FnMut(I) -> IResult<I, I, E>
-where
-    I: Input,
-    F: Fn(<I as Input>::Item) -> bool,
-{
-    take_while_m_n(n, n, cond)
-}
-
-pub fn take_one<I, E: ParseError<I>>(
-    c: char,
-) -> impl Parser<I, Output = I, Error = E>
-where
     I: Input + Offset,
-    I::Item: AsChar,
+    I::Item: AsByte,
 {
-    recognize(char(c))
+    recognize(satisfy(is_sub_delims)).parse(input)
 }
 
-pub fn take_one_of<I, T, E: ParseError<I>>(
-    list: T,
-) -> impl FnMut(I) -> IResult<I, I, E>
-where
-    I: Input,
-    I::Item: AsChar,
-    T: FindToken<char>,
-{
-    take_while_just_n(1, move |c: I::Item| list.find_token(c.as_char()))
+pub fn is_unreserved<T: AsByte>(b: T) -> bool {
+    matches!(b.as_byte(), UNRESERVED![])
 }
 
-pub fn empty<I>(input: I) -> IResult<I, I>
-where
-    I: Input + Offset + AsBytes,
-    I::Item: AsChar,
-{
-    recognize(success("")).parse(input)
+pub fn is_sub_delims<T: AsByte>(b: T) -> bool {
+    matches!(b.as_byte(), SUB_DELIMS![])
 }
-
 
 ////////////////////////////////////////
 //// Helper
 
-fn to_infalliable(_s: &str) -> Infallible {
+#[allow(unused)]
+pub(crate) fn to_infalliable(_s: &str) -> Infallible {
     unreachable!()
 }
-
-pub(crate) fn to_string<I: Input + AsBytes>(input: I) -> String {
-    safe_decode!(input.as_bytes()).to_owned()
-}
-
-pub(crate) fn to_opt_string<I: Input + AsBytes>(input: I) -> Option<String> {
-    let s = to_string(input);
-
-    if s.is_empty() { None } else { Some(s) }
-}
-
 
 
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr;
+
     use m6io::{ByteStr, bstr};
     use nom::{
         Err,
         error::{Error, ErrorKind::*},
     };
 
-    use super::pct_encoded;
-
+    use super::*;
 
     #[test]
-    fn test() {
+    fn verify_usage() {
         let bytes: &ByteStr = bstr!("%12%ab%de");
 
         assert_eq!(pct_encoded(bytes), Ok((bstr!("%ab%de"), bstr!("%12"))));
@@ -982,9 +975,42 @@ mod tests {
         assert_eq!(
             pct_encoded(bstr!("%gh")),
             Err(Err::Error(Error {
-                input: bstr!("%gh"),
-                code: TakeWhileMN
+                input: bstr!("gh"),
+                code: Satisfy
             }))
         );
+    }
+
+    #[test]
+    fn test_path() {
+        pchar("a").unwrap();
+        pchar("@").unwrap();
+
+        // matches!(hexdig(""), Err(Err::Incomplete(..)));
+        // matches!(pchar(""), Err(Err::Incomplete(..)));
+
+        on_guard_many0(pchar).parse("abc").unwrap();
+
+        segment("abc").unwrap();
+        (byte(b'/'), segment).parse("/abc").unwrap();
+
+        reg_name("abc").unwrap();
+
+        absolute_path("/a").unwrap();
+        absolute_path("/").unwrap();
+
+        host("www.baidu.com").unwrap();
+        authority("www.baidu.com").unwrap();
+
+        Scheme::from_str("www").unwrap();
+
+        println!("{:?}", request_target("/abc/def").unwrap());
+        println!("{:?}", request_target("www.baidu.com").unwrap());
+        println!("{:?}", request_target("http://www.baidu.com:234").unwrap());
+        println!("{:?}", request_target("*").unwrap());
+
+        println!("{:?}", on_guard_opt(query).parse(""));
+
+        println!("{:#?}", request_target("/").unwrap());
     }
 }

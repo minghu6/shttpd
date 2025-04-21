@@ -13,7 +13,8 @@ use m6tobytes::{derive_from_bits, derive_to_bits};
 pub use nonempty::NonEmpty;
 use parameters::ContentCoding;
 use strum::{Display, EnumString};
-use uri::RequestTarget;
+pub use case_insensitive_string::CaseInsensitiveString;
+use uri::{ RequestTarget, to_infalliable };
 use super::{charset, mime};
 
 pub mod parsing;
@@ -209,9 +210,13 @@ pub struct Fields {
 }
 
 #[derive(
-    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, EnumString, Display,
+    Debug, Clone, PartialEq, Eq, Hash, EnumString, Display,
 )]
-#[strum(ascii_case_insensitive)]
+#[strum(
+    ascii_case_insensitive,
+    parse_err_fn = to_infalliable,
+    parse_err_ty = Infallible
+)]
 pub enum FieldName {
     #[strum(serialize = "Accept")]
     Accept,
@@ -236,8 +241,8 @@ pub enum FieldName {
     AcceptRanges,
     #[strum(serialize = "Content-Range")]
     ContentRange,
-    #[strum(serialize = "{0}", default)]
-    NonStandard(Box<str>),
+    #[strum(default)]
+    NonStandard(CaseInsensitiveString),
 }
 
 ///
@@ -288,17 +293,17 @@ pub struct RawField {
 /// ```
 #[derive(Debug, Deref, DerefMut)]
 pub struct Parameters {
-    value: Vec<Pair>,
+    value: Vec<Parameter>,
 }
 
 #[derive(Debug)]
-pub struct Pair {
+pub struct Parameter {
     pub name: String,
-    pub value: PairValue,
+    pub value: ParameterValue,
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub enum PairValue {
+pub enum ParameterValue {
     Token(String),
     QStr(ByteString),
 }
@@ -310,6 +315,9 @@ pub enum SingletonFieldValue {
     Oth(ByteString),
 }
 
+///
+/// Field `MediaType`
+///
 #[derive(Debug)]
 pub struct MediaType {
     pub mime: mime::MediaType,
@@ -481,7 +489,7 @@ pub struct ChunkExt {
 #[derive(Debug)]
 pub enum ValueOrPair {
     Value(String),
-    Pair(Pair),
+    Pair(Parameter),
 }
 
 ///
@@ -787,8 +795,8 @@ impl Parameters {
         Self { value: Vec::new() }
     }
 
-    pub fn parameter(mut self, name: &str, value: PairValue) -> Self {
-        self.push(Pair {
+    pub fn parameter(mut self, name: &str, value: ParameterValue) -> Self {
+        self.push(Parameter {
             name: name.to_owned(),
             value,
         });
@@ -913,7 +921,7 @@ impl Field {
             Self::Server(..) => Server,
             Self::Date(..) => Date,
             Self::NonStandard(RawField { name, .. }) => {
-                NonStandard(name.to_string().into_boxed_str())
+                NonStandard(CaseInsensitiveString::new(name))
             }
         }
     }
@@ -938,33 +946,6 @@ impl TryFrom<u16> for StatusCode {
     }
 }
 
-impl RequestTarget {
-    pub fn path(&self) -> &str {
-        // use RequestTarget::*;
-
-        // match self {
-        //     Origin { path, .. } => path,
-        //     Absolute { uri } => uri.path(),
-        //     Authority { .. } => "/",
-        //     Asterisk => "/",
-        // }
-
-        todo!()
-    }
-
-    pub fn query(&self) -> Option<&str> {
-        // use RequestTarget::*;
-
-        // match self {
-        //     Origin { query, .. } => query.as_ref().map(|s| s.as_ref()),
-        //     Absolute { uri } => uri.query(),
-        //     Authority { .. } => None,
-        //     Asterisk => None,
-        // }
-
-        todo!()
-    }
-}
 
 
 #[cfg(test)]
@@ -987,13 +968,13 @@ mod tests {
             FieldName::ContentType
         );
         assert_eq!(
-            "ABC".to_owned(),
-            FieldName::NonStandard("ABC".to_owned().into_boxed_str())
+            "AbC".to_owned(),
+            FieldName::NonStandard(CaseInsensitiveString::new("AbC"))
                 .to_string()
         );
         assert_eq!(
-            "ABC".parse::<FieldName>().unwrap(),
-            FieldName::NonStandard("ABC".to_owned().into_boxed_str())
+            "abc".parse::<FieldName>().unwrap(),
+            FieldName::NonStandard(CaseInsensitiveString::new("AbC"))
         );
     }
 

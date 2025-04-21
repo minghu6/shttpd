@@ -16,7 +16,8 @@ http = [
     "dep:chrono",
     "dep:flate2",
     "dep:nonempty",
-    "dep:nom"
+    "dep:nom",
+    "dep:case_insensitive_string"
 ]
 full = ["parse", "http"]
 
@@ -41,5 +42,13 @@ m6parsing = { path = "../m6coll/m6parsing", optional = true }
 m6io = { path = "../m6coll/m6io", features = ["cow", "bstr", "nom"], optional = true }
 nonempty = { version = "0.11", optional = true }
 nom = { version = "8.0", optional = true }
+# case-insensive compare structure
+unicase = { version = "2.8", optional = true }
+# another case-insensive compare structure for ascii and impl From<&str> (pair with strum)
+case_insensitive_string = { version = "0.2.9", optional = true }
+
+# straight convert ascii case
+stringcase = { version = "0.4", optional = true }
+
 
 [dev-dependencies]

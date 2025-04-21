@@ -7,16 +7,23 @@
 //! 1. [RFC-9112 - HTTP/1.1](https://datatracker.ietf.org/doc/html/rfc9112)
 ///
 use std::{
-    ascii::Char::*,
-    collections::{HashMap, hash_map::Entry},
-    convert::Infallible,
-    str::FromStr,
+    ascii::Char::*, collections::{hash_map::Entry, HashMap}, convert::Infallible, ops::Deref, str::FromStr
 };
 
-use m6io::{ByteStr, ConsumeByteStr, CowBuf, FlatCow, FromByteStr};
-use nom::{character::char, combinator::{map, opt}, Parser};
+use m6io::{
+    nom::{
+        byte::{byte, crlf, digit, digit1, is_digit, is_ws, satisfy, ws}, on_guard_fold_many0, on_guard_many0, on_guard_many1, on_guard_opt, safe_as_str_parse, safe_to_string, AsByte
+    }, ByteStr, ConsumeByteStr, CowBuf, FlatCow, FromByteStr, ToByteString, ALPHA, DIGIT, WS
+};
+use nom::{
+    branch::alt, bytes::{tag_no_case, take_while_m_n}, combinator::{complete, map, map_res, opt, recognize}, error::{Error, ParseError}, sequence::{delimited, preceded, separated_pair, terminated}, AsBytes, Compare, Err, IResult, Input, Offset, Parser
+};
+use stringcase::train_case;
 
-use super::{uri::{ host, port, request_target, to_string }, *};
+use super::{
+    uri::{host, port, request_target},
+    *,
+};
 
 ////////////////////////////////////////////////////////////////////////////////
 //// Macros
@@ -30,28 +37,9 @@ macro_rules! TCHAR {
     };
 }
 
-/// 0..=9
-macro_rules! DIGIT {
-    () => {
-        b'0'..=b'9'
-    };
-}
-
-macro_rules! ALPHA {
-    () => {
-        b'a'..=b'z' | b'A'..=b'Z'
-    };
-}
-
 macro_rules! FIELD_VCHAR {
     () => {
         WS![] | VCHAR![] | OBS_TEXT![]
-    };
-}
-
-macro_rules! WS {
-    () => {
-        SP | HTAB
     };
 }
 
@@ -69,6 +57,11 @@ macro_rules! OBS_TEXT {
     };
 }
 
+///
+/// ```abnf
+/// qdtext = HTAB / SP / %x21 / %x23-5B / %x5D-7E / obs-text
+/// ```
+///
 macro_rules! QDTEXT {
     () => {
         WS![] | 0x21 | 0x23..=0x5b | 0x5d..=0x7e | OBS_TEXT![]
@@ -86,28 +79,6 @@ macro_rules! CTEXT {
     };
 }
 
-macro_rules! HEXDIG {
-    () => {
-        DIGIT![] | b'A'..=b'F' | b'a'..=b'f'
-    };
-}
-
-macro_rules! require_singleton_value {
-    ($name:expr, $raw_fields:ident) => {{
-        if $raw_fields.len() > 1 {
-            Err(format!("{} require singleton value", stringify!($name)))?;
-        }
-
-        $raw_fields.remove(0)
-    }};
-}
-
-macro_rules! field_error {
-    ($name:ident, $err:expr) => {
-        format!("Invalid filed `{}`: {}", stringify!($name), $err)
-    };
-}
-
 ////////////////////////////////////////////////////////////////////////////////
 //// Constants
 
@@ -118,7 +89,7 @@ const RPAREN: u8 = RightParenthesis.to_u8();
 
 
 trait LiftFieldValue<'a>: Sized {
-    fn lift(raw_field_values: Vec<RawFieldValue<'a>>) -> Result<Self, String>;
+    fn lift(raw_field_values: NonEmpty<RawFieldValue<'a>>) -> RawParseResult<'a, Self>;
 }
 
 
@@ -129,20 +100,32 @@ struct MaybeString {
     value: Option<String>,
 }
 
-type RawFields<'a> = HashMap<FlatCow<'a, str>, Vec<RawFieldValue<'a>>>;
+type RawFields<'a> = HashMap<FieldName, NonEmpty<RawFieldValue<'a>>>;
 
-#[derive(Debug, Clone, Deref)]
+#[derive(Clone, Deref)]
+#[deref(forward)]
 struct RawFieldValue<'a> {
     value: FlatCow<'a, ByteStr>,
 }
 
+type RawParseResult<'a, T> = Result<T, Err<Error<&'a ByteStr>>>;
+
 ////////////////////////////////////////////////////////////////////////////////
 //// Implementations
 
+impl<'a> Debug for RawFieldValue<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.value.decode_as_utf8() {
+            Ok(s) => write!(f, "{s}"),
+            Err(_) => write!(f, "[non-utf8-compatiable-data]"),
+        }
+    }
+}
+
 impl<'a> LiftFieldValue<'a> for Host {
     fn lift(
-        mut raw_field_values: Vec<RawFieldValue<'a>>,
-    ) -> Result<Self, String> {
+        mut raw_field_values: NonEmpty<RawFieldValue<'a>>,
+    ) -> RawParseResult<'a, Self> {
         let value = require_singleton_value!(Host, raw_field_values);
 
         value.value.parse().map_err(|err| field_error!(Host, err))
@@ -150,8 +133,8 @@ impl<'a> LiftFieldValue<'a> for Host {
 }
 
 impl<'a> LiftFieldValue<'a> for AcceptCharset {
-    fn lift(raw_field_values: Vec<RawFieldValue<'a>>) -> Result<Self, String> {
-        let Some(_members) = split_list_field_value(raw_field_values)?
+    fn lift(raw_field_values: Vec<RawFieldValue<'a>>) -> RawParseResult<'a, Self> {
+        let Some(_members) = field_list_based(raw_field_values)?
         else {
             unreachable!()
         };
@@ -161,8 +144,8 @@ impl<'a> LiftFieldValue<'a> for AcceptCharset {
 }
 
 impl<'a> LiftFieldValue<'a> for Accept {
-    fn lift(raw_field_values: Vec<RawFieldValue<'a>>) -> Result<Self, String> {
-        let Some(members) = split_list_field_value(raw_field_values)?
+    fn lift(raw_field_values: Vec<RawFieldValue<'a>>) -> RawParseResult<'a, Self> {
+        let Some(members) = field_list_based(raw_field_values)?
         else {
             unreachable!()
         };
@@ -204,8 +187,13 @@ impl<'a> LiftFieldValue<'a> for Accept {
 }
 
 impl<'a> LiftFieldValue<'a> for Connection {
-    fn lift(raw_field_values: Vec<RawFieldValue<'a>>) -> Result<Self, String> {
-        let Some(members) = split_list_field_value(raw_field_values)?
+    fn lift(raw_field_values: Vec<RawFieldValue<'a>>) -> RawParseResult<'a, Self> {
+        println!(
+            "RAW: {:?}",
+            raw_field_values[0].value.decode_as_utf8().unwrap()
+        );
+
+        let Some(members) = field_list_based(raw_field_values)?
         else {
             unreachable!()
         };
@@ -219,10 +207,9 @@ impl<'a> LiftFieldValue<'a> for Connection {
 
 impl<'a> LiftFieldValue<'a> for MediaType {
     fn lift(
-        mut raw_field_values: Vec<RawFieldValue<'a>>,
-    ) -> Result<Self, String> {
-        let RawFieldValue { value, .. } =
-            require_singleton_value!(MediaType, raw_field_values);
+        mut raw_field_values: NonEmpty<RawFieldValue<'a>>,
+    ) -> RawParseResult<'a, Self> {
+        let value = raw_field_values.head;
 
         let media_type = Self::from_bstr(&value)
             .map_err(|_| field_error!(MediaType, ""))?;
@@ -237,135 +224,55 @@ impl<'a> LiftFieldValue<'a> for MediaType {
 /// ```
 ///
 impl FromByteStr for Fields {
-    type Err = String;
+    type Err = nom::error::Error<ByteString>;
 
     fn from_bstr(bytes: &ByteStr) -> Result<Self, Self::Err> {
-        fn parse_raw_fields<'a>(bytes: &ByteStr) -> Result<RawFields, String> {
-            let mut i = 0;
-            let mut fields: RawFields = HashMap::new();
-
-            while i < bytes.len() {
-                /* prase field name */
-
-                let (field_name, offset) = consume_token(&bytes[i..].into());
-
-                i += offset;
-
-                if bytes[i] != Colon.into() {
-                    Err("expect `:` after field name {field_name}".to_owned())?;
-                }
-
-                i += 1;
-
-                /* consume option white spaces */
-
-                i += consume_ws(&bytes[i..]);
-
-                /* parse field value */
-
-                let (mut field_value, offset) =
-                    consume_field_value(&bytes[i..].into());
-
-                i += offset;
-
-                /* consume option white spaces */
-
-                i += consume_ws(&bytes[i..]);
-
-                /* consume CRLF */
-
-                i += consume_crlf(&bytes[i..])
-                    .map_err(|_| format!("lack CRLF after {field_name}"))?;
-
-                while i < bytes.len() {
-                    match bytes[i] {
-                        WS![] => {
-                            /*  obsolete line folding (replace CRLF with SP) */
-
-                            /* consume OBS */
-
-                            i += consume_ws(&bytes[i..]);
-
-                            /* insert(replace CRLF) space  */
-
-                            field_value.to_mut().push(SP);
-
-                            let (next_line, offset) =
-                                consume_field_value(&bytes[i..].into());
-
-                            field_value.to_mut().push_str(&next_line);
-                            i += offset;
-
-                            /* consume OBS */
-
-                            i += consume_ws(&bytes[i..]);
-
-                            /* consume CRLF */
-
-                            i += consume_crlf(&bytes[i..]).map_err(|_| {
-                                format!("lack CRLF after {field_name}")
-                            })?;
-                        }
-                        _ => break,
-                    }
-                }
-
-                /* push field */
-
-                let field_value = RawFieldValue { value: field_value };
-
-                match fields.entry(field_name) {
-                    Entry::Occupied(mut occupied) => {
-                        occupied.get_mut().push(field_value);
-                    }
-                    Entry::Vacant(vacant) => {
-                        vacant.insert(vec![field_value]);
-                    }
-                }
-            }
-
-            Ok(fields)
-        }
-
-        fn lift_fields(raw_fields: RawFields) -> Result<Fields, String> {
+        fn lift_fields(raw_fields: RawFields) -> Result<Fields, ()> {
             let mut fields = Vec::new();
 
-            for (raw_field_name, raw_field_value) in raw_fields.into_iter() {
-                let field_name = raw_field_name.parse::<FieldName>().unwrap();
+            // for (raw_field_name, raw_field_value) in raw_fields.into_iter() {
+            //     let field_name = raw_field_name.parse::<FieldName>().unwrap();
 
-                debug_assert!(!raw_field_value.is_empty());
+            //     let field_value = match &field_name {
+            //         FieldName::Connection => {
+            //             Field::Connection(Connection::lift(raw_field_value)?)
+            //         }
+            //         FieldName::Host => {
+            //             Field::Host(Host::lift(raw_field_value)?)
+            //         }
+            //         FieldName::ContentType => {
+            //             Field::ContentType(MediaType::lift(raw_field_value)?)
+            //         }
+            //         FieldName::NonStandard(..) => {
+            //             Field::NonStandard(RawField {
+            //                 name: raw_field_name.into_owned(),
+            //                 value: raw_field_value
+            //                     .into_iter()
+            //                     .map(|RawFieldValue { value, .. }| {
+            //                         value.into_owned()
+            //                     })
+            //                     .collect::<Vec<_>>(),
+            //             })
+            //         }
+            //         _ => todo!(),
+            //     };
 
-                let field_value = match &field_name {
-                    FieldName::Connection => {
-                        Field::Connection(Connection::lift(raw_field_value)?)
-                    }
-                    FieldName::Host => {
-                        Field::Host(Host::lift(raw_field_value)?)
-                    }
-                    FieldName::ContentType => {
-                        Field::ContentType(MediaType::lift(raw_field_value)?)
-                    }
-                    FieldName::NonStandard(..) => {
-                        Field::NonStandard(RawField {
-                            name: raw_field_name.into_owned(),
-                            value: raw_field_value
-                                .into_iter()
-                                .map(|RawFieldValue { value, .. }| {
-                                    value.into_owned()
-                                })
-                                .collect::<Vec<_>>(),
-                        })
-                    }
-                    _ => todo!(),
-                };
-
-                fields.push(field_value);
-            }
+            //     fields.push(field_value);
+            // }
 
             Ok(Fields { fields })
         }
 
-        Ok(lift_fields(parse_raw_fields(bytes)?)?)
+        let (i, raw_fields) =
+            field_lines.parse_complete(bytes).map_err(|err| match err {
+                Err::Incomplete(..) => unreachable!(),
+                Err::Error(error) | Err::Failure(error) => Error {
+                    input: error.input.to_owned(),
+                    code: error.code,
+                },
+            })?;
+
+        Ok::<Self, Self::Err>(lift_fields(raw_fields).unwrap())
     }
 }
 
@@ -486,7 +393,6 @@ impl FromByteStr for StartLine {
             P,
             Request { method: Method },
             Response { version: Version },
-            Finish(StartLine),
         }
 
         use State::*;
@@ -501,7 +407,6 @@ impl FromByteStr for StartLine {
                     P => error!("Method"),
                     Request { .. } => error!("RequestTarget"),
                     Response { .. } => error!("Status"),
-                    _ => unreachable!(),
                 })?
             };
         }
@@ -589,17 +494,19 @@ impl FromByteStr for StartLine {
                 (Request { method }, SP) => {
                     consume!(c = SP ? RWS);
 
-                    let target = consume!(@RequestTarget offset!(=SP ? RWS));
+                    let offset = offset!(=SP ? RWS);
+
+                    let target = consume!(@RequestTarget offset);
 
                     consume!(c = SP ? RWS);
 
                     let version = consume!(@Version 8);
 
-                    Finish(StartLine::RequestLine(RequestLine {
+                    return Ok(StartLine::RequestLine(RequestLine {
                         method,
                         target,
                         version,
-                    }))
+                    }));
                 }
                 (Response { version }, SP) => {
                     consume!(c = SP ? RWS);
@@ -611,16 +518,11 @@ impl FromByteStr for StartLine {
                     let reason =
                         consume!(@MaybeString offset!(=b'\r' ? CR)).value;
 
-                    Finish(StartLine::StatusLine(StatusLine {
+                    return Ok(StartLine::StatusLine(StatusLine {
                         version,
                         status,
                         reason,
-                    }))
-                }
-                (Finish(startline), ..) => {
-                    consume!(s = b"\r\n" ? CRLF);
-
-                    return Ok(startline);
+                    }));
                 }
                 (state, ..) => throw_state!(state),
             }
@@ -651,19 +553,20 @@ impl FromByteStr for ConnectionOption {
 }
 
 impl FromByteStr for ChunkHeader {
-    type Err = String;
-
+    type Err = String
     fn from_bstr(bytes: &ByteStr) -> Result<Self, Self::Err> {
         let mut i = 0;
 
-        let (size, offset) = consume_hexdigits_u32(bytes)
-            .map_err(|err| format!("parse chunk size failed for {err}"))?;
+        // let (size, offset) = consume_hexdigits_u32(bytes)
+        //     .map_err(|err| format!("parse chunk size failed for {err}"))?;
 
-        i += offset;
+        // i += offset;
 
-        let ext = bytes[i..].parse::<ChunkExt>()?;
+        // let ext = bytes[i..].parse::<ChunkExt>()?;
 
-        Ok(Self { size, ext })
+        // Ok(Self { size, ext })
+
+        todo!()
     }
 }
 
@@ -686,7 +589,7 @@ impl FromByteStr for ChunkExt {
         while i < bytes.len() {
             state = match (state, bytes[i]) {
                 (Start, WS![]) => {
-                    i += consume_ws(&bytes[i..]);
+                    // i += consume_ws(&bytes[i..]);
                     Start
                 }
                 (Start, b';') => {
@@ -694,13 +597,13 @@ impl FromByteStr for ChunkExt {
                     AfterSemi
                 }
                 (AfterSemi, WS![]) => {
-                    i += consume_ws(&bytes[i..]);
+                    // i += consume_ws(&bytes[i..]);
                     AfterSemi
                 }
                 (AfterSemi, TCHAR![]) => {
                     let (ext_name, offset) = consume_token(&bytes[i..].into());
                     i += offset;
-                    i += consume_ws(&bytes[i..]);
+                    // i += consume_ws(&bytes[i..]);
 
                     AfterExtName(ext_name.into_owned())
                 }
@@ -710,16 +613,16 @@ impl FromByteStr for ChunkExt {
                 }
                 (AfterExtName(ext_name), b'=') => {
                     i += 1;
-                    i += consume_ws(&bytes[i..]);
+                    // i += consume_ws(&bytes[i..]);
 
-                    let ext_value = bytes[i..].parse::<PairValue>()?;
+                    let ext_value = bytes[i..].parse::<ParameterValue>()?;
 
-                    ext.push(ValueOrPair::Pair(Pair {
+                    ext.push(ValueOrPair::Pair(Parameter {
                         name: ext_name,
                         value: ext_value,
                     }));
 
-                    i += consume_ws(&bytes[i..]);
+                    // i += consume_ws(&bytes[i..]);
 
                     Start
                 }
@@ -750,11 +653,13 @@ impl ConsumeByteStr for Host {
     type Err = String;
 
     fn consume_bstr(bytes: &ByteStr) -> Result<(Self, usize), Self::Err> {
-        let (remains, it) = map((host, opt((char(':'), port))), |(host, opt_p)| Self {
-            host: to_string(host),
-            port: opt_p.map(|(_, p)| p)
-        })
-        .parse(bytes).map_err(|err| err.to_string())?;
+        let (remains, it) =
+            map((host, opt((byte(b':'), port))), |(host, opt_p)| Self {
+                host,
+                port: opt_p.map(|(_, p)| p),
+            })
+            .parse(bytes)
+            .map_err(|err| err.to_string())?;
 
         Ok((it, bytes.len() - remains.len()))
     }
@@ -837,7 +742,7 @@ impl ConsumeByteStr for Server {
         let mut rem = vec![];
 
         while i < bytes.len() {
-            i += consume_ws(&bytes[i..]);
+            // i += consume_ws(&bytes[i..]);
 
             if bytes[i] == LPAREN {
                 let (comment, comment_offset) =
@@ -995,11 +900,11 @@ impl ConsumeByteStr for Parameters {
                     }
 
                     let (param_value, offset) =
-                        PairValue::consume_bstr(&bytes[i..])?;
+                        ParameterValue::consume_bstr(&bytes[i..])?;
 
                     i += offset;
 
-                    parameters.push(Pair {
+                    parameters.push(Parameter {
                         name: param_name.into_owned(),
                         value: param_value,
                     });
@@ -1015,11 +920,11 @@ impl ConsumeByteStr for Parameters {
 }
 
 
-impl ConsumeByteStr for PairValue {
+impl ConsumeByteStr for ParameterValue {
     type Err = String;
 
     fn consume_bstr(bytes: &ByteStr) -> Result<(Self, usize), Self::Err> {
-        use PairValue::*;
+        use ParameterValue::*;
 
         let (pair_value, offset) = if !bytes.is_empty() && bytes[0] == b'"' {
             let (qstr, offset) = consume_qstr(&bytes.into())
@@ -1277,18 +1182,496 @@ impl FromStr for RequestTarget {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let (it, n) = Self::consume_bstr(ByteStr::new(s))?;
 
-        if s.len() > n {
-            Err(())
-        }
-        else {
-            Ok(it)
-        }
+        if s.len() > n { Err(()) } else { Ok(it) }
     }
 }
 
 
 ////////////////////////////////////////////////////////////////////////////////
 //// Functions
+
+
+pub fn field_media_type<'i, I>(
+    input: I,
+) -> IResult<I, MediaType>
+where
+    I: Input + Offset + AsBytes,
+    I::Item: AsByte,
+
+    {
+
+    }
+
+///
+/// ```abnf
+/// field-lines = *( field-line CRLF )
+/// ```
+///
+fn field_lines<'i, I>(input: I) -> IResult<I, RawFields<'i>>
+where
+    I: Input + Offset + AsBytes + 'i,
+    I::Item: AsByte,
+{
+    on_guard_fold_many0(
+        terminated(field_line, crlf),
+        HashMap::<FieldName, NonEmpty<RawFieldValue<'i>>>::new,
+        |mut map, (name, value)| {
+            match map.entry(name) {
+                Entry::Occupied(mut occupied) => {
+                    occupied.get_mut().push(RawFieldValue { value });
+                }
+                Entry::Vacant(vacant) => {
+                    vacant.insert(NonEmpty::new(RawFieldValue { value }));
+                }
+            }
+            map
+        },
+    )
+    .parse(input)
+}
+
+///
+/// ```abnf
+/// field-line = field-name ":" OWS *(field-value obs-fold) field-value OWS
+/// ```
+///
+pub fn field_line<'i, I>(
+    input: I,
+) -> IResult<I, (FieldName, FlatCow<'i, ByteStr>)>
+where
+    I: Input + Offset + AsBytes,
+    I::Item: AsByte,
+{
+    map(
+        (
+            field_name,
+            byte(b':'),
+            ows,
+            map(
+                on_guard_many0(terminated(field_value::<I>, obs_fold)),
+                |values| {
+                    if values.len() == 0 {
+                        FlatCow::own_new(ByteString::new())
+                    }
+                    else if values.len() == 1 {
+                        FlatCow::borrow_new(unsafe {
+                            ByteStr::from_bytes_permanently(
+                                values[0].as_bytes(),
+                            )
+                        })
+                    }
+                    else {
+                        /*join with space */
+
+                        let size = values
+                            .iter()
+                            .map(|v| v.as_bytes().len())
+                            .sum::<usize>()
+                            + (values.len() - 1);
+
+                        let mut owned = ByteString::with_capacity(size);
+
+                        let mut iter = values.into_iter();
+
+                        owned.push_str(ByteStr::new(
+                            iter.next().unwrap().as_bytes(),
+                        ));
+
+                        for v in iter {
+                            owned.push(SP);
+                            owned.push_str(ByteStr::new(v.as_bytes()));
+                        }
+
+                        FlatCow::own_new(owned)
+                    }
+                },
+            ),
+            map(field_value::<I>, |i: I| {
+                FlatCow::borrow_new(unsafe {
+                    ByteStr::from_bytes_permanently(i.as_bytes())
+                })
+            }),
+            ows,
+        ),
+        |(name, _colon, _ows1, mut folds, last_value, _ows2)| {
+            let value = if folds.is_empty() {
+                last_value
+            }
+            else {
+                folds.to_mut().push_str(&last_value);
+                folds
+            };
+
+            (name, value)
+        },
+    )
+    .parse(input)
+}
+
+///
+/// ```
+/// obs-fold = OWS CRLF RWS
+///          ; obsolete line folding
+/// ```
+///
+pub fn obs_fold<I>(input: I) -> IResult<I, I>
+where
+    I: Input + Offset,
+    I::Item: AsByte,
+{
+    recognize((ows, crlf, rws)).parse(input)
+}
+
+///
+/// bad white space
+///
+pub fn bws<I>(input: I) -> IResult<I, I>
+where
+    I: Input + Offset,
+    I::Item: AsByte,
+{
+    ows(input)
+}
+
+///
+/// optional white space
+///
+pub fn ows<I>(input: I) -> IResult<I, I>
+where
+    I: Input + Offset,
+    I::Item: AsByte,
+{
+    recognize(on_guard_many0(ws)).parse(input)
+}
+
+///
+/// required white space
+///
+pub fn rws<I>(input: I) -> IResult<I, I>
+where
+    I: Input + Offset,
+    I::Item: AsByte,
+{
+    recognize(on_guard_many1(ws)).parse(input)
+}
+
+///
+/// ```abnf
+/// field-name = token
+/// ```
+///
+pub fn field_name<I>(input: I) -> IResult<I, FieldName>
+where
+    I: Input + Offset + AsBytes,
+    I::Item: AsByte,
+{
+    map(token, |i: I| safe_as_str_parse::<I, FieldName>(i).unwrap())
+        .parse(input)
+}
+
+///
+/// ```abnf
+/// token = 1*tchar
+/// ```
+///
+pub fn token<I>(input: I) -> IResult<I, I>
+where
+    I: Input + Offset,
+    I::Item: AsByte,
+{
+    recognize(on_guard_many1(tchar)).parse(input)
+}
+
+///
+/// ```abnf
+/// tchar = "!" / "#" / "$" / "%" / "&" / "'" / "*"
+///       / "+" / "-" / "." / "^" / "_" / "`" / "|" / "~"
+///       / DIGIT / ALPHA
+///       ; any VCHAR, except delimiters
+/// ```
+///
+pub fn tchar<I>(input: I) -> IResult<I, I>
+where
+    I: Input + Offset,
+    I::Item: AsByte,
+{
+    recognize(satisfy(|b| matches!(b, TCHAR![]))).parse(input)
+}
+
+///
+/// ```abnf
+/// field-value = *field-content
+/// ```
+///
+pub fn field_value<I>(input: I) -> IResult<I, I>
+where
+    I: Input + Offset,
+    I::Item: AsByte,
+{
+    recognize(on_guard_many0(field_content)).parse(input)
+}
+
+///
+/// ```abnf
+/// field-content  = field-vchar
+///                  [ 1*( SP / HTAB / field-vchar ) field-vchar ]
+/// ```
+pub fn field_content<I>(input: I) -> IResult<I, I>
+where
+    I: Input + Offset,
+    I::Item: AsByte,
+{
+    recognize((
+        field_vchar,
+        on_guard_opt((
+            on_guard_many1(satisfy(|b| matches!(b, WS![] | FIELD_VCHAR![]))),
+            field_vchar,
+        )),
+    ))
+    .parse(input)
+}
+
+///
+/// ```abnf
+/// field-vchar = VCHAR / obs-text
+/// ```
+///
+pub fn field_vchar<I>(input: I) -> IResult<I, I::Item>
+where
+    I: Input,
+    I::Item: AsByte,
+{
+    satisfy(|b| matches!(b, FIELD_VCHAR![])).parse(input)
+}
+
+///
+/// ```abnf
+/// quoted-string = DQUOTE *( qdtext / quoted-pair ) DQUOTE
+/// ```
+///
+pub fn quoted_string<I>(input: I) -> IResult<I, ByteString>
+where
+    I: Input,
+    I::Item: AsByte,
+{
+    delimited(
+        byte(b'"'),
+        map(
+            on_guard_fold_many0(
+                alt((qdtext, quoted_pair)),
+                ByteString::new,
+                |mut s, c: I::Item| {
+                    s.push(c.as_byte());
+                    s
+                },
+            ),
+            |i| i.into(),
+        ),
+        byte(b'"'),
+    )
+    .parse(input)
+}
+
+///
+/// ```abnf
+/// qdtext = HTAB / SP / %x21 / %x23-5B / %x5D-7E / obs-text
+/// ```
+///
+pub fn qdtext<I>(input: I) -> IResult<I, I::Item>
+where
+    I: Input,
+    I::Item: AsByte,
+{
+    satisfy(|b| matches!(b, QDTEXT![])).parse(input)
+}
+
+///
+/// ```abnf
+/// quoted-pair = "\" ( HTAB / SP / VCHAR / obs-text )
+/// ```
+///
+pub fn quoted_pair<I>(input: I) -> IResult<I, I::Item>
+where
+    I: Input,
+    I::Item: AsByte,
+{
+    preceded(
+        byte(b'\\'),
+        satisfy(|b| matches!(b, WS![] | FIELD_VCHAR![])),
+    )
+    .parse(input)
+}
+
+///
+/// ```abnf
+/// comment = "(" *( ctext / quoted-pair / comment ) ")"
+/// ```
+///
+pub fn comment<I>(input: I) -> IResult<I, I>
+where
+    I: Input + Offset,
+    I::Item: AsByte,
+{
+    delimited(
+        byte(LPAREN),
+        recognize(on_guard_many0(alt((
+            recognize(ctext),
+            recognize(quoted_pair),
+            comment,
+        )))),
+        byte(RPAREN),
+    )
+    .parse(input)
+}
+
+///
+/// ```abnf
+/// ctext = HTAB / SP / %x21-27 / %x2A-5B / %x5D-7E / obs-text
+/// ```
+///
+pub fn ctext<I>(input: I) -> IResult<I, I::Item>
+where
+    I: Input,
+    I::Item: AsByte,
+{
+    satisfy(|b| matches!(b, CTEXT![])).parse(input)
+}
+
+///
+/// ```
+/// use osimodel::application::http::parsing::weight;
+///
+/// assert_eq!(weight(" ;q=0.24").map(|(_, v)| v), Ok(0.24f32));
+/// ```
+///
+/// ```abnf
+/// weight = OWS ";" OWS "q=" qvalue
+/// ```
+///
+pub fn weight<I>(input: I) -> IResult<I, f32>
+where
+    I: Input + Offset + AsBytes,
+    for<'a> I: Compare<&'a str>,
+    I::Item: AsByte,
+{
+    preceded((ows, byte(b';'), ows, tag_no_case("q=")), qvalue).parse(input)
+}
+
+pub fn decimal_u32<I>(input: I) -> IResult<I, u32>
+where
+    I: Input + Offset + AsBytes,
+    I::Item: AsByte,
+{
+    map_res(digit1, |s| safe_as_str_parse(s)).parse(input)
+}
+
+///
+/// ```rust
+/// use osimodel::application::http::parsing::qvalue;
+///
+/// assert_eq!(qvalue("0.24").map(|(_, v)| v), Ok(0.24f32));
+/// assert_eq!(qvalue("1.").map(|(_, v)| v), Ok(1f32));
+/// ```
+///
+/// ```abnf
+/// qvalue = ( "0" [ "." 0*3DIGIT ] )
+///        / ( "1" [ "." 0*3("0") ] )
+/// ```
+///
+///
+pub fn qvalue<I>(input: I) -> IResult<I, f32>
+where
+    I: Input + Offset + AsBytes,
+    I::Item: AsByte,
+{
+    map_res(
+        alt((
+            recognize((
+                byte(b'0'),
+                on_guard_opt((byte(b'.'), take_while_m_n(0, 3, is_digit))),
+            )),
+            recognize((
+                byte(b'1'),
+                on_guard_opt((
+                    byte(b'.'),
+                    take_while_m_n(0, 3, |b: I::Item| b.as_byte() == b'0'),
+                )),
+            )),
+        )),
+        |i| safe_as_str_parse(i),
+    )
+    .parse(input)
+}
+
+///
+/// ```abnf
+/// parameters = *( OWS ";" OWS [ parameter ] )
+/// ```
+///
+pub fn parameters<I>(input: I) -> IResult<I, Parameters>
+where
+    I: Input + Offset + AsBytes,
+    I::Item: AsByte,
+{
+    on_guard_fold_many0(
+        (ows, byte(b';'), ows, opt(parameter)),
+        Parameters::new,
+        |mut params, (_ows1, _semi, _ows2, opt_param)| {
+            if let Some(p) = opt_param {
+                params.push(p);
+            }
+
+            params
+        }
+    ).parse(input)
+}
+
+///
+/// ```abnf
+/// parameter = parameter-name "=" parameter-value
+/// ```
+///
+pub fn parameter<I>(input: I) -> IResult<I, Parameter>
+where
+    I: Input + Offset + AsBytes,
+    I::Item: AsByte,
+{
+    map(
+        separated_pair(parameter_name, byte(b'='), parameter_value),
+        |(name, value)| Parameter { name, value }
+    ).parse(input)
+}
+
+///
+/// ```abnf
+/// parameter-name  = token
+/// ```
+///
+pub fn parameter_name<I>(input: I) -> IResult<I, String>
+where
+    I: Input + Offset + AsBytes,
+    I::Item: AsByte,
+{
+    map(token, safe_to_string).parse(input)
+}
+
+///
+/// ```abnf
+/// parameter-value = ( token / quoted-string )
+/// ```
+///
+pub fn parameter_value<I>(input: I) -> IResult<I, ParameterValue>
+where
+    I: Input + Offset + AsBytes,
+    I::Item: AsByte,
+{
+    use ParameterValue::*;
+
+    alt((
+        map(token, |i:I| Token(safe_to_string(i))),
+        map(quoted_string, |i| QStr(i))
+    )).parse(input)
+}
 
 ///
 /// first byte is double-quote
@@ -1332,7 +1715,7 @@ fn consume_qstr<'a>(
             }
             (InStr, b'\\') => Quoting,
             (Quoting, WS![] | VCHAR![] | OBS_TEXT![]) => {
-                buf.clone_push(b);
+                buf.clone_push(bytes[i]);
 
                 InStr
             }
@@ -1367,37 +1750,13 @@ fn consume_token<'a>(
     (bytes.as_slice_cow(..i).try_into().unwrap(), i)
 }
 
-fn consume_field_value<'a>(
-    bytes: &FlatCow<'a, ByteStr>,
-) -> (FlatCow<'a, ByteStr>, usize) {
-    let mut i = 0;
-
-    while i < bytes.len() {
-        match bytes[i] {
-            FIELD_VCHAR![] => (),
-            _ => break,
-        }
-
-        i += 1;
-    }
-
-    (bytes.as_slice_cow(..i), i)
-}
-
-fn consume_crlf(bytes: &ByteStr) -> Result<usize, ()> {
-    if bytes.len() < 4 {
-        Err(())?;
-    }
-
-    if bytes == b"\r\n" { Ok(4) } else { Err(()) }
-}
 
 fn consume_maybe_weight(bytes: &ByteStr) -> Result<Option<(f32, usize)>, ()> {
     let mut i = 0;
 
     /* consume maybe space */
 
-    i += consume_ws(bytes);
+    // i += consume_ws(bytes);
 
     if i < bytes.len() && bytes[i] == Semicolon.to_u8() {
         i += 1;
@@ -1406,7 +1765,7 @@ fn consume_maybe_weight(bytes: &ByteStr) -> Result<Option<(f32, usize)>, ()> {
         return Ok(None);
     }
 
-    i += consume_ws(bytes);
+    // i += consume_ws(bytes);
 
     if i + 2 < bytes.len()
         && (&bytes[i..i + 2] == b"q=" || &bytes[i..i + 2] == b"Q=")
@@ -1463,22 +1822,6 @@ fn consume_maybe_weight(bytes: &ByteStr) -> Result<Option<(f32, usize)>, ()> {
     }))
 }
 
-fn consume_ws(bytes: &ByteStr) -> usize {
-    let mut i = 0;
-
-    /* consume maybe space */
-
-    while i < bytes.len() {
-        match bytes[i] {
-            WS![] => (),
-            _ => break,
-        }
-
-        i += 1;
-    }
-
-    i
-}
 
 fn consume_decimal_str(bytes: &ByteStr) -> (&str, usize) {
     let mut i = 0;
@@ -1495,28 +1838,6 @@ fn consume_decimal_str(bytes: &ByteStr) -> (&str, usize) {
     (bytes[..i].decode_as_utf8().unwrap(), i)
 }
 
-fn consume_hexdig_str(bytes: &ByteStr) -> (&str, usize) {
-    let mut i = 0;
-
-    while i < bytes.len() {
-        match bytes[i] {
-            HEXDIG![] => (),
-            _ => break,
-        }
-
-        i += 1;
-    }
-
-    (bytes[..i].decode_as_utf8().unwrap(), i)
-}
-
-fn consume_hexdigits_u32(bytes: &ByteStr) -> Result<(u32, usize), String> {
-    let (s, offset) = consume_hexdig_str(bytes);
-
-    u32::from_str_radix(s, 16)
-        .map_err(|err| err.to_string())
-        .map(|v| (v, offset))
-}
 
 /// another impl style (without explicit state)
 fn consume_comment<'a>(
@@ -1584,81 +1905,88 @@ fn consume_comment<'a>(
     Ok((buf.to_cow(), i))
 }
 
-fn split_list_field_value<'a>(
-    filed_values: Vec<RawFieldValue<'a>>,
-) -> Result<Option<NonEmpty<RawFieldValue<'a>>>, String> {
+
+///
+/// ```abnf
+/// part = *( comment ) (quoted-string / token) *( comment )
+/// line = part *( OWS "," OWS part )
+/// ```
+///
+fn field_list_based<'a>(
+    filed_values: &'a NonEmpty<RawFieldValue<'a>>,
+) -> RawParseResult<'a, NonEmpty<RawFieldValue<'a>>>
+{
+    fn part<'a, I>(input: I) -> IResult<I, RawFieldValue<'a>>
+    where
+        I: Input + Offset + AsBytes,
+        I::Item: AsByte,
+    {
+        delimited(
+            on_guard_many0(comment),
+            alt((
+                map(quoted_string, |s| RawFieldValue {
+                    value: FlatCow::own_new(s),
+                }),
+                map(token, |i: I| RawFieldValue {
+                    value: unsafe {
+                        FlatCow::borrow_new(ByteStr::from_bytes_permanently(
+                            i.as_bytes(),
+                        ))
+                    },
+                }),
+            )),
+            on_guard_many0(comment),
+        )
+        .parse(input)
+    }
+
+    fn line<'a, I>(input: I) -> IResult<I, NonEmpty<RawFieldValue<'a>>>
+    where
+        I: Input + Offset + AsBytes,
+        I::Item: AsByte,
+    {
+        map(
+            (
+                part,
+                on_guard_fold_many0(
+                    preceded((ows, byte(b','), ows), part),
+                    Vec::new,
+                    |mut vec, p| {
+                        vec.push(p);
+                        vec
+                    },
+                ),
+            ),
+            |(head, tail)| NonEmpty { head, tail },
+        )
+        .parse(input)
+    }
+
     let mut members = vec![];
 
-    use QuotingEnv::*;
-    use State::*;
+    for field_value in filed_values {
+        let (_i, nonempty) = line(field_value.deref())?;
 
-    let mut state = Normal;
-
-    #[derive(Clone, Copy)]
-    enum State {
-        Normal,
-        InComment(usize),
-        InStr,
-        Quoting(QuotingEnv),
+        members.extend(nonempty);
     }
 
-    #[derive(Clone, Copy)]
-    enum QuotingEnv {
-        Comment(usize),
-        Str,
-    }
-
-    for field_value in filed_values.into_iter() {
-        let RawFieldValue { value, .. } = field_value;
-
-        let mut ep = 0; // end point
-
-        for (i, b) in value.iter().cloned().enumerate() {
-            state = match (state, b) {
-                (Normal, b'"') => InStr,
-                (Normal, LPAREN) => InComment(1),
-                (Normal, b',') => {
-                    members.push(RawFieldValue {
-                        value: value.as_slice_cow(ep..i),
-                    });
-                    ep = i;
-                    state
-                }
-                (Normal, _) => state,
-                (InStr, QDTEXT![]) => state,
-                (InComment(..), CTEXT![]) => state,
-                (InStr | InComment(..), b'\\') => Quoting(match state {
-                    InStr => Str,
-                    InComment(cnt) => Comment(cnt),
-                    _ => unreachable!(),
-                }),
-                (Quoting(env), WS![] | VCHAR![] | OBS_TEXT![]) => match env {
-                    Str => InStr,
-                    Comment(cnt) => InComment(cnt),
-                },
-                (InStr, b'"') => Normal,
-                (InComment(cnt), RPAREN) => {
-                    if cnt > 0 {
-                        InComment(cnt - 1)
-                    }
-                    else {
-                        Normal
-                    }
-                }
-                _ => Err("split list-based filed value failed")?,
-            }
-        }
-    }
-
-    Ok(NonEmpty::from_vec(members))
+    Ok(NonEmpty::from_vec(members).unwrap())
 }
+
 
 
 #[cfg(test)]
 mod tests {
-    use m6io::ToByteString;
+    use m6io::{ToByteString, bstr};
 
     use super::*;
+
+    #[test]
+    fn test_parse_comment() {
+        let input = bstr!("(linux (ubuntu))");
+
+        println!("{:#?}", comment(input).unwrap());
+    }
 
     #[test]
     fn test_parse_server() {
@@ -1706,15 +2034,38 @@ mod tests {
 
     #[test]
     fn test_parse_start_line() {
-        let StartLine::RequestLine(request_line) = ByteStr::new(b"GET / HTTP/1.1").parse::<StartLine>().unwrap() else {
+        bstr!("/").parse::<RequestTarget>().unwrap();
+
+        let StartLine::RequestLine(request_line) =
+            bstr!("GET / HTTP/1.1").parse::<StartLine>().unwrap()
+        else {
             unreachable!()
         };
 
-        let RequestTarget::Origin { abs_path, .. } = request_line.target else { unreachable!() };
+        let RequestTarget::Origin { abs_path, .. } = request_line.target
+        else {
+            unreachable!()
+        };
 
-        assert_eq!(
-            abs_path,
-            "/"
-        );
+        assert_eq!(abs_path, "/");
+
+        bstr!("GET / HTTP/1.1").parse::<StartLine>().unwrap();
+
+        bstr!("GET www.baidu.com HTTP/1.1")
+            .parse::<StartLine>()
+            .unwrap();
+    }
+
+    #[test]
+    fn test_parse_fields() {
+        let raw = "Accept: */*\r
+Accept-Encoding: gzip, deflate\r
+Connection: keep-alive\r
+Host: localhost\r
+";
+
+        let raw = ByteStr::new(raw);
+
+        // println!("{:?}", alt::<()>((field_vchar, ws)).parse(r"\a"))
     }
 }
