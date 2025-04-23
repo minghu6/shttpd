@@ -14,7 +14,7 @@ pub use nonempty::NonEmpty;
 use parameters::ContentCoding;
 use strum::{Display, EnumString};
 pub use case_insensitive_string::CaseInsensitiveString;
-use uri::{ RequestTarget, to_infalliable };
+use uri::RequestTarget;
 use super::{charset, mime};
 
 pub mod parsing;
@@ -250,7 +250,6 @@ pub enum FieldName {
 /// Host = uri-host [ ":" port ]
 /// ```
 ///
-///
 #[derive(Debug)]
 pub struct Host {
     pub host: String,
@@ -343,12 +342,12 @@ pub struct MediaRange {
 ///
 #[derive(Debug, Deref, DerefMut)]
 pub struct Accept {
-    pub values: Vec<(MediaRange, f32)>,
+    pub values: NonEmpty<(MediaRange, f32)>,
 }
 
 /// deprecated field (for utf-8 has become nearly ubiquitous)
 pub struct AcceptCharset {
-    pub values: Vec<(Charset, f32)>,
+    pub values: NonEmpty<(Charset, f32)>,
 }
 
 pub enum Charset {

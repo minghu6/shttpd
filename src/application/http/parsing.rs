@@ -7,23 +7,33 @@
 //! 1. [RFC-9112 - HTTP/1.1](https://datatracker.ietf.org/doc/html/rfc9112)
 ///
 use std::{
-    ascii::Char::*, collections::{hash_map::Entry, HashMap}, convert::Infallible, ops::Deref, str::FromStr
+    ascii::Char::*,
+    collections::{HashMap, hash_map::Entry},
+    convert::Infallible,
+    ops::Deref,
+    str::FromStr,
 };
 
 use m6io::{
     nom::{
-        byte::{byte, crlf, digit, digit1, is_digit, is_ws, satisfy, ws}, on_guard_fold_many0, on_guard_many0, on_guard_many1, on_guard_opt, safe_as_str_parse, safe_to_string, AsByte
+        byte::{byte, crlf, digit1, is_digit, is_ws, satisfy, ws}, on_guard_fold_many0, on_guard_many0, on_guard_many1, on_guard_opt, safe_as_str, safe_as_str_parse, safe_to_string, AsByte
     }, ByteStr, ConsumeByteStr, CowBuf, FlatCow, FromByteStr, ToByteString, ALPHA, DIGIT, WS
 };
 use nom::{
-    branch::alt, bytes::{tag_no_case, take_while_m_n}, combinator::{complete, map, map_res, opt, recognize}, error::{Error, ParseError}, sequence::{delimited, preceded, separated_pair, terminated}, AsBytes, Compare, Err, IResult, Input, Offset, Parser
+    AsBytes, Compare, Err, IResult, Input, Offset, Parser,
+    branch::alt,
+    bytes::{tag, tag_no_case, take_while_m_n},
+    combinator::{complete, map, map_res, opt, recognize, verify},
+    error::{Error, ErrorKind, ParseError},
+    sequence::{delimited, preceded, separated_pair, terminated},
 };
 use stringcase::train_case;
 
 use super::{
-    uri::{host, port, request_target},
+    uri::{host as uri_host, port, request_target},
     *,
 };
+use crate::application::mime::{MediaTopType, MessageType, TextType};
 
 ////////////////////////////////////////////////////////////////////////////////
 //// Macros
@@ -89,7 +99,9 @@ const RPAREN: u8 = RightParenthesis.to_u8();
 
 
 trait LiftFieldValue<'a>: Sized {
-    fn lift(raw_field_values: NonEmpty<RawFieldValue<'a>>) -> RawParseResult<'a, Self>;
+    fn lift(
+        raw_field_values: NonEmpty<RawFieldValue<'a>>,
+    ) -> RawParseResult<Self>;
 }
 
 
@@ -102,13 +114,19 @@ struct MaybeString {
 
 type RawFields<'a> = HashMap<FieldName, NonEmpty<RawFieldValue<'a>>>;
 
-#[derive(Clone, Deref)]
+#[derive(Deref)]
 #[deref(forward)]
 struct RawFieldValue<'a> {
     value: FlatCow<'a, ByteStr>,
 }
 
-type RawParseResult<'a, T> = Result<T, Err<Error<&'a ByteStr>>>;
+type RawParseResult<T> = Result<T, Err<Error<ByteString>>>;
+
+#[derive(Deref)]
+#[deref(forward)]
+struct RawFieldValues<'a> {
+    value: NonEmpty<RawFieldValue<'a>>,
+}
 
 ////////////////////////////////////////////////////////////////////////////////
 //// Implementations
@@ -124,97 +142,49 @@ impl<'a> Debug for RawFieldValue<'a> {
 
 impl<'a> LiftFieldValue<'a> for Host {
     fn lift(
-        mut raw_field_values: NonEmpty<RawFieldValue<'a>>,
-    ) -> RawParseResult<'a, Self> {
-        let value = require_singleton_value!(Host, raw_field_values);
-
-        value.value.parse().map_err(|err| field_error!(Host, err))
+        raw_field_values: NonEmpty<RawFieldValue<'a>>,
+    ) -> RawParseResult<Self> {
+        map_parser_singleton(&raw_field_values, host)
     }
 }
 
 impl<'a> LiftFieldValue<'a> for AcceptCharset {
-    fn lift(raw_field_values: Vec<RawFieldValue<'a>>) -> RawParseResult<'a, Self> {
-        let Some(_members) = field_list_based(raw_field_values)?
-        else {
-            unreachable!()
-        };
-
+    fn lift(
+        raw_field_values: NonEmpty<RawFieldValue<'a>>,
+    ) -> RawParseResult<Self> {
         todo!()
     }
 }
 
 impl<'a> LiftFieldValue<'a> for Accept {
-    fn lift(raw_field_values: Vec<RawFieldValue<'a>>) -> RawParseResult<'a, Self> {
-        let Some(members) = field_list_based(raw_field_values)?
-        else {
-            unreachable!()
-        };
-
-        let values = members
-            .into_iter()
-            .map(|member| {
-                let RawFieldValue { mut value, .. } = member;
-
-                let (media_range, range_type_offset) =
-                    mime::MediaRangeType::consume_bstr(&value).map_err(
-                        |_| field_error!(Accept, "Invalid MediaRange"),
-                    )?;
-
-                value = value.as_slice_cow(range_type_offset..);
-
-                let (parameters, parameters_offset) =
-                    Parameters::consume_bstr(&value).map_err(|_| {
-                        field_error!(Accept, "Invalid Parameters")
-                    })?;
-
-                let weight = consume_maybe_weight(&value[parameters_offset..])
-                    .map_err(|_| field_error!(Accept, "Invalid weight"))?
-                    .map(|x| x.0)
-                    .unwrap_or(1.0);
-
-                Ok::<(MediaRange, f32), String>((
-                    MediaRange {
-                        mime: media_range,
-                        parameters,
-                    },
-                    weight,
-                ))
-            })
-            .try_collect::<Vec<(MediaRange, f32)>>()?;
-
-        Ok(Self { values })
+    fn lift(
+        raw_field_values: NonEmpty<RawFieldValue<'a>>,
+    ) -> RawParseResult<Self> {
+        fold_map_parser_field_list(
+            &field_list_based(&raw_field_values)?,
+            (media_range, weight),
+            |values| Self { values },
+        )
     }
 }
 
 impl<'a> LiftFieldValue<'a> for Connection {
-    fn lift(raw_field_values: Vec<RawFieldValue<'a>>) -> RawParseResult<'a, Self> {
-        println!(
-            "RAW: {:?}",
-            raw_field_values[0].value.decode_as_utf8().unwrap()
-        );
-
-        let Some(members) = field_list_based(raw_field_values)?
-        else {
-            unreachable!()
-        };
-
-        Ok(Self {
-            value: members
-                .try_map(|member| member.parse::<ConnectionOption>())?,
-        })
+    fn lift(
+        raw_field_values: NonEmpty<RawFieldValue<'a>>,
+    ) -> RawParseResult<Self> {
+        fold_map_res_field_list(
+            field_list_based(&raw_field_values)?,
+            |v| safe_as_str_parse(v.deref()),
+            |value| Connection { value },
+        )
     }
 }
 
 impl<'a> LiftFieldValue<'a> for MediaType {
     fn lift(
-        mut raw_field_values: NonEmpty<RawFieldValue<'a>>,
-    ) -> RawParseResult<'a, Self> {
-        let value = raw_field_values.head;
-
-        let media_type = Self::from_bstr(&value)
-            .map_err(|_| field_error!(MediaType, ""))?;
-
-        Ok(media_type)
+        raw_field_values: NonEmpty<RawFieldValue<'a>>,
+    ) -> RawParseResult<Self> {
+        map_parser_singleton(&raw_field_values, media_type)
     }
 }
 
@@ -553,7 +523,7 @@ impl FromByteStr for ConnectionOption {
 }
 
 impl FromByteStr for ChunkHeader {
-    type Err = String
+    type Err = String;
     fn from_bstr(bytes: &ByteStr) -> Result<Self, Self::Err> {
         let mut i = 0;
 
@@ -649,21 +619,15 @@ impl ConsumeByteStr for RequestTarget {
     }
 }
 
-impl ConsumeByteStr for Host {
-    type Err = String;
+// impl ConsumeByteStr for Host {
+//     type Err = String;
 
-    fn consume_bstr(bytes: &ByteStr) -> Result<(Self, usize), Self::Err> {
-        let (remains, it) =
-            map((host, opt((byte(b':'), port))), |(host, opt_p)| Self {
-                host,
-                port: opt_p.map(|(_, p)| p),
-            })
-            .parse(bytes)
-            .map_err(|err| err.to_string())?;
+//     fn consume_bstr(bytes: &ByteStr) -> Result<(Self, usize), Self::Err> {
+//         let it = map_parser_singleton(bytes, host)?;
 
-        Ok((it, bytes.len() - remains.len()))
-    }
-}
+//         Ok((it, bytes.len() - remains.len()))
+//     }
+// }
 
 impl ConsumeByteStr for mime::MediaRangeType {
     type Err = ();
@@ -1190,17 +1154,144 @@ impl FromStr for RequestTarget {
 ////////////////////////////////////////////////////////////////////////////////
 //// Functions
 
+///
+/// ```abnf
+/// Host = uri-host [ ":" port ]
+/// ```
+pub fn host<I>(input: I) -> IResult<I, Host>
+where
+    I: Input + Offset + AsBytes + Compare<&'static str>,
+    I::Item: AsByte,
+{
+    map(
+        (uri_host, on_guard_opt(preceded(byte(b':'), port))),
+        |(host, port)| Host { host, port },
+    )
+    .parse(input)
+}
 
-pub fn field_media_type<'i, I>(
-    input: I,
-) -> IResult<I, MediaType>
+///
+/// ```abnf
+///  media-range = ( "*/*"
+///                  / ( type "/" "*" )
+///                  / ( type "/" subtype )
+///                ) parameters
+/// ```
+///
+pub fn media_range<I>(input: I) -> IResult<I, MediaRange>
+where
+    I: Input + Offset + AsBytes + Compare<&'static str>,
+    I::Item: AsByte,
+{
+    use mime::MediaRangeType::*;
+
+    map(
+        (
+            alt((
+                map(tag("*/*"), |_| StarStar),
+                map_res(terminated(r#type, tag("/*")), |s| {
+                    Ok::<_, <MediaTopType as FromStr>::Err>(TypeStar(
+                        s.parse::<MediaTopType>()?,
+                    ))
+                }),
+                map(mime_media_type, |mime| TypeSubType(mime)),
+            )),
+            parameters,
+        ),
+        |(mime, parameters)| MediaRange { mime, parameters },
+    )
+    .parse(input)
+}
+
+///
+/// ```abnf
+/// media-type = mime-media-type parameters
+/// ```
+///
+pub fn media_type<I>(input: I) -> IResult<I, MediaType>
 where
     I: Input + Offset + AsBytes,
     I::Item: AsByte,
+{
+    map((mime_media_type, parameters), |(mime, parameters)| {
+        MediaType { mime, parameters }
+    })
+    .parse(input)
+}
 
-    {
+///
+/// ```abnf
+/// mime-media-type = type "/" subtype
+/// type       = token
+/// subtype    = token
+/// ```
+///
+pub fn mime_media_type<I>(input: I) -> IResult<I, mime::MediaType>
+where
+    I: Input + Offset + AsBytes,
+    I::Item: AsByte,
+{
+    map_res(
+        separated_pair(r#type, byte(b'/'), subtype),
+        |(top_type, sub_type)| {
+            use MediaTopType::*;
 
-    }
+            let top_type = top_type.parse::<MediaTopType>()?;
+
+            Ok::<mime::MediaType, strum::ParseError>(match top_type {
+                Application => todo!(),
+                Audio => todo!(),
+                Font => todo!(),
+                Haptics => todo!(),
+                Image => todo!(),
+                Message => {
+                    mime::MediaType::Message(sub_type.parse::<MessageType>()?)
+                }
+                Model => todo!(),
+                Multipart => todo!(),
+                Text => mime::MediaType::Text(sub_type.parse::<TextType>()?),
+                Video => todo!(),
+            })
+        },
+    )
+    .parse(input)
+}
+
+///
+/// ```abnf
+/// type = token
+/// ```
+///
+pub fn r#type<'i, I>(input: I) -> IResult<I, &'i str>
+where
+    I: Input + Offset + AsBytes + 'i,
+    I::Item: AsByte,
+{
+    map(token, safe_as_str).parse(input)
+}
+
+///
+/// ```abnf
+/// subtype = token
+/// ```
+///
+pub fn subtype<'i, I>(input: I) -> IResult<I, &'i str>
+where
+    I: Input + Offset + AsBytes + 'i,
+    I::Item: AsByte,
+{
+    r#type(input)
+}
+
+// pub fn field_media_type<'i, I>(
+//     input: I,
+// ) -> IResult<I, MediaType>
+// where
+//     I: Input + Offset + AsBytes,
+//     I::Item: AsByte,
+//     {
+
+//     }
 
 ///
 /// ```abnf
@@ -1622,8 +1713,9 @@ where
             }
 
             params
-        }
-    ).parse(input)
+        },
+    )
+    .parse(input)
 }
 
 ///
@@ -1638,13 +1730,14 @@ where
 {
     map(
         separated_pair(parameter_name, byte(b'='), parameter_value),
-        |(name, value)| Parameter { name, value }
-    ).parse(input)
+        |(name, value)| Parameter { name, value },
+    )
+    .parse(input)
 }
 
 ///
 /// ```abnf
-/// parameter-name  = token
+/// parameter-name  = token ; and shouldn't eq 'q'/'Q' in semantics
 /// ```
 ///
 pub fn parameter_name<I>(input: I) -> IResult<I, String>
@@ -1652,7 +1745,8 @@ where
     I: Input + Offset + AsBytes,
     I::Item: AsByte,
 {
-    map(token, safe_to_string).parse(input)
+    verify(map(token, safe_to_string), |s: &str| s != "q" && s != "Q")
+        .parse(input)
 }
 
 ///
@@ -1668,9 +1762,10 @@ where
     use ParameterValue::*;
 
     alt((
-        map(token, |i:I| Token(safe_to_string(i))),
-        map(quoted_string, |i| QStr(i))
-    )).parse(input)
+        map(token, |i: I| Token(safe_to_string(i))),
+        map(quoted_string, |i| QStr(i)),
+    ))
+    .parse(input)
 }
 
 ///
@@ -1914,8 +2009,7 @@ fn consume_comment<'a>(
 ///
 fn field_list_based<'a>(
     filed_values: &'a NonEmpty<RawFieldValue<'a>>,
-) -> RawParseResult<'a, NonEmpty<RawFieldValue<'a>>>
-{
+) -> RawParseResult<NonEmpty<RawFieldValue<'a>>> {
     fn part<'a, I>(input: I) -> IResult<I, RawFieldValue<'a>>
     where
         I: Input + Offset + AsBytes,
@@ -1965,12 +2059,80 @@ fn field_list_based<'a>(
     let mut members = vec![];
 
     for field_value in filed_values {
-        let (_i, nonempty) = line(field_value.deref())?;
+        let (_i, nonempty) = line(field_value.deref())
+            .map_err(|err| err.map_input(ToOwned::to_owned))?;
 
         members.extend(nonempty);
     }
 
     Ok(NonEmpty::from_vec(members).unwrap())
+}
+
+fn map_singleton<'a, T, E2>(
+    field_values: &'a NonEmpty<RawFieldValue<'a>>,
+    mut f: impl FnMut(&RawFieldValue<'a>) -> Result<T, E2>,
+) -> RawParseResult<T> {
+    let input = &field_values.head;
+
+    f(&input).map_err(|_err| {
+        Err::Error(Error {
+            input: input.deref().to_owned(),
+            code: ErrorKind::MapRes,
+        })
+    })
+}
+
+fn map_parser_singleton<'a: 'b, 'b, T>(
+    field_values: &'a NonEmpty<RawFieldValue<'a>>,
+    mut parser: impl Parser<&'b ByteStr, Output = T, Error = Error<&'b ByteStr>>,
+) -> RawParseResult<T> {
+    let input = &field_values.head;
+
+    let res = parser.parse(input.deref()).map_err(|err| {
+        err.map_input(|i| i.to_bstring())
+    }).map(|(_i, it)| it);
+
+    res
+}
+
+fn fold_map_parser_field_list<'a: 'b, 'b, T, C>(
+    field_values: &'a NonEmpty<RawFieldValue<'a>>,
+    mut f: impl Parser<&'b ByteStr, Output = T, Error = Error<&'b ByteStr>>,
+    g: impl Fn(NonEmpty<T>) -> C,
+) -> RawParseResult<C> {
+    let mut vec = Vec::with_capacity(field_values.len());
+
+    for v in field_values {
+        match f.parse(&v.value.as_ref()) {
+            Ok((_i, it)) => {
+                vec.push(it)
+            }
+            Result::Err(err) => {
+                Err(err.map_input(|i| i.to_bstring()))?
+            },
+        }
+    }
+
+    Ok(g(NonEmpty::from_vec(vec).unwrap()))
+}
+
+fn fold_map_res_field_list<'a, T, C, E2>(
+    field_values: NonEmpty<RawFieldValue<'a>>,
+    mut f: impl FnMut(&RawFieldValue<'a>) -> Result<T, E2>,
+    g: impl Fn(NonEmpty<T>) -> C,
+) -> RawParseResult<C> {
+    let mut vec = Vec::with_capacity(field_values.len());
+
+    for v in field_values {
+        vec.push(f(&v).map_err(|_| {
+            Err::Error(Error {
+                input: v.value.into_owned(),
+                code: ErrorKind::MapRes,
+            })
+        })?)
+    }
+
+    Ok(g(NonEmpty::from_vec(vec).unwrap()))
 }
 
 

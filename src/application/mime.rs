@@ -1,4 +1,5 @@
 
+
 use strum::{ EnumString, Display };
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -11,7 +12,8 @@ pub enum MediaRangeType {
     TypeSubType(MediaType)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Display)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Display, EnumString)]
+#[strum(ascii_case_insensitive)]
 pub enum MediaTopType {
     Application,
     Audio,
@@ -23,11 +25,6 @@ pub enum MediaTopType {
     Multipart,
     Text,
     Video,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Display)]
-pub enum MediaRangeSubType {
-
 }
 
 /// Refer [IANA](https://www.iana.org/assignments/media-types/media-types.xhtml)
@@ -67,4 +64,3 @@ pub enum MessageType {
 
 ////////////////////////////////////////////////////////////////////////////////
 //// Implementations
-

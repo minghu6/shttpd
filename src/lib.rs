@@ -6,6 +6,7 @@
 #![feature(ascii_char)]
 #![feature(trivial_bounds)]
 #![feature(impl_trait_in_assoc_type)]
+#![feature(anonymous_lifetime_in_impl_trait)]
 
 pub mod datalink;
 pub mod network;

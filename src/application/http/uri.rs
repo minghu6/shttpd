@@ -241,8 +241,7 @@ impl HierPart {
 ///
 pub fn request_target<I>(input: I) -> IResult<I, RequestTarget>
 where
-    I: Input + Offset + AsBytes,
-    for<'a> I: Compare<&'a str>,
+    I: Input + Offset + AsBytes + Compare<&'static str>,
     I::Item: AsByte,
 {
     use RequestTarget::*;
@@ -266,8 +265,7 @@ where
 ///
 pub fn absolute_path<I>(input: I) -> IResult<I, String>
 where
-    I: Input + Offset + AsBytes,
-    for<'a> I: Compare<&'a str>,
+    I: Input + Offset + AsBytes + Compare<&'static str>,
     I::Item: AsByte,
 {
     map(
@@ -284,8 +282,7 @@ where
 ///
 pub fn uri<I>(input: I) -> IResult<I, URI>
 where
-    I: Input + Offset + AsBytes,
-    for<'a> I: Compare<&'a str>,
+    I: Input + Offset + AsBytes + Compare<&'static str>,
     I::Item: AsByte,
 {
     map(
@@ -318,8 +315,7 @@ where
 ///
 pub fn hier_part<I>(input: I) -> IResult<I, HierPart>
 where
-    I: Input + Offset + AsBytes,
-    for<'a> I: Compare<&'a str>,
+    I: Input + Offset + AsBytes + Compare<&'static str>,
     I::Item: AsByte,
 {
     use HierPart::*;
@@ -350,8 +346,7 @@ where
 ///
 pub fn absolute_uri<I>(input: I) -> IResult<I, AbsoluteURI>
 where
-    I: Input + Offset + AsBytes,
-    for<'a> I: Compare<&'a str>,
+    I: Input + Offset + AsBytes + Compare<&'static str>,
     I::Item: AsByte,
 {
     map(
@@ -377,8 +372,7 @@ where
 ///
 pub fn relative_ref<I>(input: I) -> IResult<I, I>
 where
-    I: Input + Offset + AsBytes,
-    for<'a> I: Compare<&'a str>,
+    I: Input + Offset + AsBytes + Compare<&'static str>,
     I::Item: AsByte,
 {
     recognize((
@@ -399,8 +393,7 @@ where
 ///
 pub fn relative_part<I>(input: I) -> IResult<I, I>
 where
-    I: Input + Offset + AsBytes,
-    for<'a> I: Compare<&'a str>,
+    I: Input + Offset + AsBytes + Compare<&'static str>,
     I::Item: AsByte,
 {
     alt((
@@ -441,8 +434,7 @@ where
 ///
 pub fn authority<I>(input: I) -> IResult<I, Authority>
 where
-    I: Input + Offset + AsBytes,
-    for<'a> I: Compare<&'a str>,
+    I: Input + Offset + AsBytes + Compare<&'static str>,
     I::Item: AsByte,
 {
     map(
@@ -467,8 +459,7 @@ where
 ///
 pub fn userinfo<I>(input: I) -> IResult<I, I>
 where
-    I: Input + Offset,
-    for<'a> I: Compare<&'a str>,
+    I: Input + Offset + Compare<&'static str>,
     I::Item: AsByte,
 {
     recognize(on_guard_many0(alt((
@@ -487,8 +478,7 @@ where
 ///
 pub fn host<I>(input: I) -> IResult<I, String>
 where
-    I: Input + Offset + AsBytes,
-    for<'a> I: Compare<&'a str>,
+    I: Input + Offset + AsBytes + Compare<&'static str>,
     I::Item: AsByte,
 {
     map(alt((ip_literal, ipv4address, reg_name)), safe_to_string).parse(input)
@@ -504,8 +494,7 @@ where
 ///
 pub fn port<I>(input: I) -> IResult<I, u16>
 where
-    I: Input + Offset + AsBytes,
-    for<'a> I: Compare<&'a str>,
+    I: Input + Offset + AsBytes + Compare<&'static str>,
     I::Item: AsByte,
 {
     map_res(digit1, |s: I| safe_as_str_parse(s)).parse(input)
@@ -518,8 +507,7 @@ where
 ///
 pub fn ip_literal<I>(input: I) -> IResult<I, I>
 where
-    I: Input + Offset,
-    for<'a> I: Compare<&'a str>,
+    I: Input + Offset + Compare<&'static str>,
     I::Item: AsByte,
 {
     recognize((byte(b'['), alt((ipv6address, ip_vfuture)), byte(b']')))
@@ -560,8 +548,7 @@ where
 ///
 pub fn ipv6address<I>(input: I) -> IResult<I, I>
 where
-    I: Input + Offset,
-    for<'a> I: Compare<&'a str>,
+    I: Input + Offset + Compare<&'static str>,
     I::Item: AsByte,
 {
     recognize(alt((
@@ -627,8 +614,7 @@ where
 ///
 pub fn ones32<I>(input: I) -> IResult<I, I>
 where
-    I: Input + Offset,
-    for<'a> I: Compare<&'a str>,
+    I: Input + Offset + Compare<&'static str>,
     I::Item: AsByte,
 {
     // m <= len <= n).
@@ -643,8 +629,7 @@ where
 ///
 pub fn ipv4address<I>(input: I) -> IResult<I, I>
 where
-    I: Input + Offset,
-    for<'a> I: Compare<&'a str>,
+    I: Input + Offset + Compare<&'static str>,
     I::Item: AsByte,
 {
     // m <= len <= n).
@@ -673,8 +658,7 @@ where
 ///
 pub fn dec_octet<I>(input: I) -> IResult<I, I>
 where
-    I: Input + Offset,
-    for<'a> I: Compare<&'a str>,
+    I: Input + Offset + Compare<&'static str>,
     I::Item: AsByte,
 {
     // m <= len <= n).
@@ -697,8 +681,7 @@ where
 ///
 pub fn reg_name<I>(input: I) -> IResult<I, I>
 where
-    I: Input + Offset,
-    for<'a> I: Compare<&'a str>,
+    I: Input + Offset + Compare<&'static str>,
     I::Item: AsByte,
 {
     recognize(on_guard_many0(alt((unreserved, pct_encoded, sub_delims))))
