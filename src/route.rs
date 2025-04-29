@@ -1,32 +1,36 @@
 use std::{
-    fmt::Write, fs::read_to_string, iter::once_with, path::Path,
-    process::Command,
+    ffi::OsString, fmt::Write, fs::read_to_string, iter::once_with,
+    path::Path, process::Command,
 };
 
 use chrono::{DateTime, Local};
 use log::info;
-use m6ptr::{ByteString, FromBytesAs};
-use osimodel::application::http::{
-    MediaType,
-    Method::*,
-    Request,
-    parameters::ContentCoding,
-    writing::{FieldBuf, MediaTypeBuf, ResponseBuf},
+use m6io::ByteString;
+use osimodel::application::{
+    http::{
+        Allow, Body, Chunk, Codings, CompleteRequest, CompleteResponse,
+        ContentEncoding, Field, Fields, MediaType, Method::*, Parameters,
+        Request, parameters::ContentCoding,
+    },
+    mime::{self, TextType},
 };
 use qstring::QString;
 
 use crate::{
     conf::{CGIMap, SERV_CONF},
-    resp::{classic_ok, internal, just_ok, method_not_allowed, not_found},
+    resp::{
+        bad_request, classic_ok, internal, just_ok, method_not_allowed,
+        not_acceptable, not_found,
+    },
+    worker::Secondment,
 };
 
 ////////////////////////////////////////////////////////////////////////////////
 //// Structures
 
-
 pub struct CGIMessage {
     /// first line
-    pub content_type: MediaTypeBuf,
+    pub content_type: MediaType,
     pub content: ByteString,
 }
 
@@ -35,14 +39,18 @@ pub struct CGIMessage {
 //// Implementations
 
 impl TryFrom<ByteString> for CGIMessage {
-    type Error = ();
+    type Error = String;
 
     fn try_from(mut bytes: ByteString) -> Result<Self, Self::Error> {
-        let ln_1st_pos = bytes.find(b'\n').ok_or(())?;
+        let fields_pos = bytes.find(b"\r\n").ok_or("No header fields")?;
 
-        let content = bytes.split_off(ln_1st_pos + 1);
-        let content_type =
-            MediaType::from_bytes_as(&bytes.as_ref().into())?.into();
+        let content = bytes.split_off(fields_pos + 2);
+        let fields = bytes.parse::<Fields>().map_err(|err| err.to_string())?;
+
+        let Some(content_type) = fields.content_type().cloned()
+        else {
+            Err(format!("No content-type in fields"))?
+        };
 
         Ok(Self {
             content_type,
@@ -51,62 +59,165 @@ impl TryFrom<ByteString> for CGIMessage {
     }
 }
 
+impl<'a> Secondment<'a> {
+    pub fn resolve_route(
+        &mut self,
+        request: CompleteRequest,
+    ) -> Result<CompleteResponse, CompleteResponse> {
+        let CompleteRequest { request, body } = request;
 
-pub fn resolve<'a>(request: &Request<'a>) -> ResponseBuf {
-    let method = request.method;
-    let path = request.target.path();
-    let q = QString::from(request.target.query().unwrap_or_default());
+        let method = request.method;
+        let Some(path) = request.target.path()
+        else {
+            Err(bad_request("No Path"))?
+        };
+        let q = QString::from(request.target.query().unwrap_or_default());
 
-    info!("Incomming request: {:#?}", request);
+        Ok(match method {
+            Get => {
+                /* index html */
+                if path == "/" {
+                    info!("Get index html");
 
-    match method {
-        Get => {
-            /* index html */
-            if path == "/" {
-                info!("Get index html");
+                    load_static(&request)?
+                }
+                else if let Some(cgi_map) = SERV_CONF.cgi.get(path) {
+                    info!("Get cgi item: {cgi_map:?}");
 
-                match SERV_CONF.doc.index_html() {
-                    // use br to compress static file
-                    Ok(content) => classic_ok(
-                        vec![vec![ContentCoding::Br].into()],
-                        content.into(),
-                    ),
-                    Err(err) => internal(err),
+                    run_cgi(cgi_map, q).map_err(|err| {
+                        internal(&format!(
+                            "run cgi {cgi_map:#?} failed: {err}"
+                        ))
+                    })?
+                }
+                else {
+                    info!("Get try access dir {path}");
+
+                    show_file(path).map_err(|err| {
+                        internal(&format!("get file info failed: {err}"))
+                    })?
                 }
             }
-            else if let Some(cgi_map) = SERV_CONF.cgi.get(path) {
-                info!("Get cgi item: {cgi_map:?}");
+            Head => just_ok("".into()),
+            Options => classic_ok(
+                vec![Field::Allow(
+                    Allow::new()
+                        .method(Get)
+                        .method(Head)
+                        .method(Post)
+                        .method(Options),
+                )],
+                vec![],
+            ),
+            Post => {
+                match body {
+                    Body::Empty | Body::Complete(..) => {
+                        method_not_allowed("Only support ")
+                    }
+                    Body::Chunked => {
+                        // chunked `echo`
 
-                run_cgi(cgi_map, q).unwrap_or_else(|err| {
-                    internal(&format!("run cgi error: {err}"))
-                })
-            }
-            else {
-                info!("Get try access dir {path}");
+                        let mut collected = Vec::new();
 
-                show_file(path).unwrap_or_else(|err| {
-                    internal(&format!("get file info failed: {err}"))
-                })
+                        for chunk_res in self.read_chunks() {
+                            let Chunk { data, .. } = chunk_res?;
+
+                            collected.push(data.to_vec());
+                        }
+
+
+                        just_ok(collected.join(&b"\n"[..]))
+                    }
+                }
             }
-        }
-        _ => method_not_allowed(),
+            _ => method_not_allowed(""),
+        })
     }
 }
 
-fn run_cgi(cgi_map: &CGIMap, q: QString) -> Result<ResponseBuf, String> {
-    let persis_dir = cgi_map
-        .persis_dir()?
-        .to_str()
-        .ok_or("invalid persist directory")?
-        .to_owned();
+
+////////////////////////////////////////////////////////////////////////////////
+//// Functions
+
+fn load_static(
+    request: &Request,
+) -> Result<CompleteResponse, CompleteResponse> {
+    use ContentCoding::*;
+
+    /* check accept-encoding */
+
+    let options = [
+        (Br, SERV_CONF.doc.index_html_br()),
+        (Gzip, SERV_CONF.doc.index_html_gzip()),
+    ];
+
+    let (found, maybe_coding) = if let Some(accept_encoding) =
+        request.fields.accept_encoding()
+    {
+        let mut maybe_found = None;
+
+        for (coding, _) in accept_encoding.priority_codings() {
+            if let Some(i) = options.iter().position(|(coding2, _res)| {
+                Codings::Spec(*coding2) == coding || coding == Codings::Star
+            }) {
+                maybe_found = Some((options[i].1, Some(options[i].0)));
+                break;
+            }
+        }
+
+        if let Some((found, maybe_coding)) = maybe_found {
+            (found, maybe_coding)
+        }
+        else if accept_encoding
+            .rejected_codings()
+            .into_iter()
+            .find(|coding| {
+                *coding == Codings::Identity || *coding == Codings::Star
+            })
+            .is_some()
+        {
+            Err(not_acceptable())?
+        }
+        else {
+            (SERV_CONF.doc.index_html_raw(), None)
+        }
+    }
+    else {
+        (options[0].1, Some(options[0].0))
+    };
+
+    match found {
+        // use br to compress static file
+        Ok(content) => {
+            let mut extra_fields = vec![Field::ContentType(MediaType {
+                mime: mime::MediaType::Text(TextType::HTML),
+                parameters: Parameters::new(),
+            })];
+
+            if let Some(coding) = maybe_coding {
+                extra_fields.push(Field::ContentEncoding(
+                    ContentEncoding::new().content_coding(coding),
+                ));
+            }
+
+            Ok(classic_ok(extra_fields, content.into()))
+        }
+        Err(err) => Err(internal(err)),
+    }
+}
+
+fn run_cgi(cgi_map: &CGIMap, q: QString) -> Result<CompleteResponse, String> {
+    let persis_dir = cgi_map.persis_dir().as_os_str().to_owned();
 
     let envs = q
         .into_pairs()
         .into_iter()
-        .map(|(k, v)| (format!("SHTTPD_Q_{}", k.to_uppercase()), v))
+        .map(|(k, v)| {
+            (format!("SHTTPD_Q_{}", k.to_uppercase()), OsString::from(v))
+        })
         .chain(once_with(|| ("SHTTPD_PERSIS_DIR".to_owned(), persis_dir)));
 
-    let output = Command::new(cgi_map.exec_path()?)
+    let output = Command::new(cgi_map.exec_path())
         .envs(envs)
         .output()
         .map_err(|err| err.to_string())?;
@@ -121,15 +232,15 @@ fn run_cgi(cgi_map: &CGIMap, q: QString) -> Result<ResponseBuf, String> {
 
     let cgi: CGIMessage = raw_out
         .try_into()
-        .map_err(|_| "malformed cgi output format".to_owned())?;
+        .map_err(|s| format!("malformed cgi output format: {s}"))?;
 
     Ok(classic_ok(
-        vec![FieldBuf::ContentType(cgi.content_type)],
-        cgi.content,
+        vec![Field::ContentType(cgi.content_type)],
+        cgi.content.into(),
     ))
 }
 
-fn show_file(path: &str) -> Result<ResponseBuf, String> {
+fn show_file(path: &str) -> Result<CompleteResponse, String> {
     let subp = path
         .strip_prefix("/")
         .ok_or("invalid path")
@@ -139,7 +250,7 @@ fn show_file(path: &str) -> Result<ResponseBuf, String> {
 
     Ok(if docp.is_file() {
         match read_to_string(docp) {
-            Ok(content) => just_ok(content.into_bytes().into()),
+            Ok(content) => just_ok(content.into_bytes()),
             Err(err) => internal(&err.to_string()),
         }
     }
@@ -190,11 +301,11 @@ fn show_file(path: &str) -> Result<ResponseBuf, String> {
         }
 
         match show_dir(&docp) {
-            Ok(content) => just_ok(content.into_bytes().into()),
+            Ok(content) => just_ok(content.into_bytes()),
             Err(err) => internal(&err.to_string()),
         }
     }
     else {
-        not_found(&docp.to_string_lossy())
+        not_found(&format!("not found: {}", docp.to_string_lossy()))
     })
 }

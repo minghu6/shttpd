@@ -17,14 +17,28 @@ Query Parameter `XX`: `SHTTPD_Q_XX`
 
 recommend `httpie` (python http client terminal app) to test sttpd
 
+1. Test Default Index
+
+    `http get 127.0.0.1`
+
+2. Test Show files / diretory
+
+    `http get 127.0.0.1/log4rs.yaml -v`
+
+    `http get 127.0.0.1/log -v`
+
+
+
 ### Debug
 
 Use remote debug to bypass privilege restrict.
 
 1. start server
+Run in `${workspaceFolder}`
+
 `sudo lldb-server platform --server --listen 0.0.0.0:8081`
 
-2. launch.json config
+1. launch.json config
 
 ```json
 "initCommands": [
@@ -32,4 +46,6 @@ Use remote debug to bypass privilege restrict.
     "platform connect connect://localhost:8081",
     "settings set target.inherit-env true", // See note below.
 ],
+
+"args": ["-c", "examples/example-1/Shttpd.toml"],
 ```

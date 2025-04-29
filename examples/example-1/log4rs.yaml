@@ -8,7 +8,7 @@ appenders:
       kind: compound
       trigger:
         kind: size
-        limit: 10mb
+        limit: 50mb
       roller:
         kind: fixed_window
         pattern: examples/example-1/log/archive/shttpd.{}.log

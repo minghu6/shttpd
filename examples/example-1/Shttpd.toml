@@ -1,4 +1,6 @@
 
+timeout = 25_000
+
 [cgi]
 root = "examples/example-1/cgi"
 
@@ -19,3 +21,4 @@ root = "examples/example-1/persist"
 
 [log]
 config = "examples/example-1/log4rs.yaml"
+  

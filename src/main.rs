@@ -1,3 +1,11 @@
+#![feature(ascii_char_variants)]
+#![feature(ascii_char)]
+#![feature(maybe_uninit_slice)]
+#![feature(result_flattening)]
+#![feature(coroutines)]
+#![feature(async_iterator)]
+#![feature(iter_from_coroutine)]
+
 use std::fs::read_to_string;
 
 use clap::Parser;

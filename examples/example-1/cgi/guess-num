@@ -2,6 +2,9 @@
 
 import os
 import random
+from typing import Optional, Tuple
+
+from click import Option
 
 ENV_Q_PREFIX = 'SHTTPD_Q_'
 ENV_PERSIS_ROOT = 'SHTTPD_PERSIS_ROOT'
@@ -24,34 +27,40 @@ for key, val in os.environ.items():
 
 persis_file = os.path.join(env_persis_dir, "1.txt")
 
-def gen_num(range):
-    n = random.randrange(range)
+def gen_num(end: int):
+    n = random.randrange(0, end, 1)
+
     with open(persis_file, 'w') as w:
-        w.write(f'{range},{n}')
+        w.write(f'{end}, {n}')
 
 
-def get_num():
+def get_num() -> Tuple[int, int]:
     s = None
+
+    if not os.path.exists(persis_file):
+        gen_num(101)
+
     with open(persis_file, 'r') as r:
         s = r.read()
     return [int(i) for i in s.split(',')]
 
 
 def cli():
-    print(f'content-type: text/plain; charset=UTF-8')
+    print(f'Content-Type: text/plain; charset=UTF-8', end='\r\n')
+    print(end='\r\n')
 
     g = q.get('G')
     if g:
         g = int(g) if g else 100
         print(f'Generate a new number between 0-{g}')
-        gen_num(g)
+        gen_num(g + 1)
         return
 
     n = q.get('N')
     if n:
         n = int(n) if n else 0
-        (range, target) = get_num()
-        print(f'range between 0-{range}')
+        (end, target) = get_num()
+        print(f'range between 0-{end-1}')
 
         if n == target:
             print("BINGO!")
@@ -68,8 +77,8 @@ def cli():
     if not os.path.exists(persis_file):
         print('Not Exist')
     else:
-        (range, target) = get_num()
-        print(f'Range: {range}')
+        (end, target) = get_num()
+        print(f'Range: {end}')
 
 
 if __name__ == '__main__':

@@ -31,24 +31,5 @@
                 "RUST_LOG": "trace"
             }
         },
-        {
-            "type": "lldb",
-            "request": "launch",
-            "name": "Debug unit tests in executable 'shttpd'",
-            "cargo": {
-                "args": [
-                    "test",
-                    "--no-run",
-                    "--bin=shttpd",
-                    "--package=shttpd"
-                ],
-                "filter": {
-                    "name": "shttpd",
-                    "kind": "bin"
-                }
-            },
-            "args": [],
-            "cwd": "${workspaceFolder}"
-        }
     ]
 }

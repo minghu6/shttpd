@@ -10,7 +10,9 @@ for key, val in os.environ.items():
 
 
 if __name__ == '__main__':
-    print(f'Content-Type: text/plain; charset=UTF-8')
+    print(f'Content-Type: text/plain; charset=UTF-8', end='\r\n')
+    print(end='\r\n')
+
     print("Queries:")
     for key, val in q.items():
         print(f'{key}: {val}')

@@ -1,10 +1,12 @@
 use std::{
     fs::read,
+    io::Write,
     path::{Path, PathBuf},
     sync::LazyLock,
 };
 
 use brotli::{BrotliCompress, enc::BrotliEncoderParams};
+use flate2::{Compression, write::GzEncoder};
 use log4rs::Config;
 use m6ptr::OnceStatic;
 use serde::Deserialize;
@@ -34,9 +36,14 @@ pub struct ServConf {
     pub cgi: CGI,
     pub doc: Doc,
     pub persist: Persist,
-    pub listen_port: u16,
-    pub timeout: u64,
     pub log: Option<Log>,
+    pub listen_port: u16,
+    /// in milliseconds
+    pub timeout: u64,
+    /// in bytes
+    pub max_header_size: u64,
+    /// in bytes
+    pub max_body_size: u64,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -44,9 +51,11 @@ pub struct ServConfOpt {
     pub cgi: Option<CGI>,
     pub doc: Option<Doc>,
     pub persist: Option<Persist>,
+    pub log: Option<Log>,
     pub listen_port: Option<u16>,
     pub timeout: Option<u64>,
-    pub log: Option<Log>,
+    pub max_header_size: Option<u64>,
+    pub max_body_size: Option<u64>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -85,6 +94,8 @@ impl ServConfOpt {
         let ServConf {
             listen_port: default_listen_port,
             timeout: default_timeout,
+            max_header_size: default_max_header_size,
+            max_body_size: default_max_body_size,
             ..
         } = ServConf::default();
 
@@ -94,6 +105,8 @@ impl ServConfOpt {
             persist,
             listen_port,
             timeout,
+            max_body_size,
+            max_header_size,
             log,
         } = self;
 
@@ -101,9 +114,12 @@ impl ServConfOpt {
             cgi: cgi.unwrap_or_default(),
             doc: doc.unwrap_or_default(),
             persist: persist.unwrap_or_default(),
+            log,
             listen_port: listen_port.unwrap_or(default_listen_port),
             timeout: timeout.unwrap_or(default_timeout),
-            log,
+            max_header_size: max_header_size
+                .unwrap_or(default_max_header_size),
+            max_body_size: max_body_size.unwrap_or(default_max_body_size),
         }
     }
 }
@@ -126,52 +142,77 @@ impl CGI {
 }
 
 impl CGIMap {
-    pub fn exec_path(&self) -> Result<PathBuf, String> {
-        Ok(SERV_CONF.cgi.root.join(
-            &self
-                .route
-                .as_path()
-                .strip_prefix("/")
-                .map_err(|err| err.to_string())?,
-        ))
+    pub fn exec_path(&self) -> PathBuf {
+        SERV_CONF.cgi.root.join(&self.cgi.as_path())
     }
 
-    /// very disgusting operation
-    pub fn subdir_path(&self) -> Result<&Path, String> {
-        self.route
-            .as_path()
-            .parent()
-            .unwrap_or(Path::new(""))
-            .strip_prefix("/")
-            .map_err(|err| err.to_string())
-    }
-
-    pub fn persis_dir(&self) -> Result<PathBuf, String> {
-        Ok(SERV_CONF.persist.root.join(self.subdir_path()?))
+    pub fn persis_dir(&self) -> PathBuf {
+        SERV_CONF.persist.root.join(self.cgi.as_path())
     }
 }
 
 impl Doc {
     /// compressed by `Br`
-    pub fn index_html(&self) -> Result<&[u8], &str> {
-        static INDEX_HTML: LazyLock<Result<Vec<u8>, String>> =
+    pub fn index_html_br(&self) -> Result<&[u8], &str> {
+        static INDEX_HTML_BR: LazyLock<Result<Vec<u8>, String>> =
             LazyLock::new(|| {
-                let raw_content = read(SERV_CONF.doc.index_html_path())
-                    .map_err(|err| err.to_string())?;
+                SERV_CONF
+                    .doc
+                    .index_html_raw()
+                    .map(|raw_content| {
+                        let mut compressed_content = Vec::new();
 
-                let mut compressed_content = Vec::new();
+                        BrotliCompress(
+                            &mut &raw_content[..],
+                            &mut compressed_content,
+                            &BrotliEncoderParams::default(),
+                        )
+                        .map_err(|err| err.to_string())?;
 
-                BrotliCompress(
-                     &mut &raw_content[..],
-                    &mut compressed_content,
-                    &BrotliEncoderParams::default(),
-                )
-                .map_err(|err| err.to_string())?;
-
-                Ok(compressed_content)
+                        Ok(compressed_content)
+                    })
+                    .map_err(|err| err.to_owned())
+                    .flatten()
             });
 
-        INDEX_HTML
+        INDEX_HTML_BR
+            .as_ref()
+            .map(|res| res.as_ref())
+            .map_err(|err| err.as_str())
+    }
+
+    pub fn index_html_gzip(&self) -> Result<&[u8], &str> {
+        static INDEX_HTML_GZIP: LazyLock<Result<Vec<u8>, String>> =
+            LazyLock::new(|| {
+                SERV_CONF
+                    .doc
+                    .index_html_raw()
+                    .map(|raw_content| {
+                        let mut gzencoder =
+                            GzEncoder::new(Vec::new(), Compression::default());
+
+                        gzencoder.write_all(raw_content).unwrap();
+
+                        Ok(gzencoder.finish().unwrap())
+                    })
+                    .map_err(|err| err.to_owned())
+                    .flatten()
+            });
+
+        INDEX_HTML_GZIP
+            .as_ref()
+            .map(|res| res.as_ref())
+            .map_err(|err| err.as_str())
+    }
+
+    pub fn index_html_raw(&self) -> Result<&[u8], &str> {
+        static INDEX_HTML_RAW: LazyLock<Result<Vec<u8>, String>> =
+            LazyLock::new(|| {
+                read(SERV_CONF.doc.index_html_path())
+                    .map_err(|err| err.to_string())
+            });
+
+        INDEX_HTML_RAW
             .as_ref()
             .map(|res| res.as_ref())
             .map_err(|err| err.as_str())
@@ -202,12 +243,16 @@ impl Default for Persist {
 impl Default for ServConf {
     fn default() -> Self {
         Self {
-            listen_port: 80,
-            timeout: 5_000_00, // 5s
             cgi: Default::default(),
             doc: Default::default(),
             persist: Default::default(),
             log: Default::default(),
+            listen_port: 80,
+            timeout: 5_000, // 5s
+            // 16 KB
+            max_header_size: 16 * 1024,
+            // 16 MB
+            max_body_size: 16 * 1024 * 1024,
         }
     }
 }
@@ -239,7 +284,6 @@ pub fn default_log4rs_config() -> Config {
         .build(root)
         .unwrap()
 }
-
 
 
 #[cfg(test)]

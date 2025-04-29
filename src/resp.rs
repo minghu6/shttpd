@@ -1,77 +1,138 @@
 use chrono::Local;
-use m6ptr::{ByteStr, ByteString, FromBytesAs};
+use m6io::ByteStr;
 use osimodel::application::http::{
-    Server,
+    Body::Complete,
+    CompleteResponse, Connection, ConnectionOption, Field, FieldName, Fields,
+    Response, Server,
     StatusCode::{self, *},
     Version,
-    writing::{FieldBuf, FieldsBuf, ResponseBuf, ServerBuf},
 };
 
 use crate::conf::SERVER_NAME;
 
+
+pub fn close(mut complete_response: CompleteResponse) -> CompleteResponse {
+    if !complete_response
+        .response
+        .fields
+        .contains(FieldName::Connection)
+    {
+        complete_response
+            .response
+            .fields
+            .push(Field::Connection(Connection::new().connection(ConnectionOption::Close) ));
+    }
+
+    complete_response
+}
+
 /// 200
-pub fn just_ok(msg: ByteString) -> ResponseBuf {
-    error_response(Ok, msg)
+pub fn just_ok(msg: Vec<u8>) -> CompleteResponse {
+    simplified_response(Ok, msg.into_boxed_slice())
 }
 
 pub fn classic_ok<'a>(
-    extra_fileds: Vec<FieldBuf>,
-    body: ByteString,
-) -> ResponseBuf {
-    let status = Ok;
+    extra_fileds: Vec<Field>,
+    body: Vec<u8>,
+) -> CompleteResponse {
+    complete_response(Ok, extra_fileds, body)
+}
 
-    ResponseBuf {
-        version: Version::HTTP11,
-        status,
-        reason: Some(status.reason().to_owned()),
-        fields: FieldsBuf {
-            fields: vec![
-                vec![
-                    FieldBuf::Date(Local::now().into()),
-                    FieldBuf::Server(server_name()),
-                ],
-                extra_fileds,
-            ]
-            .into_iter()
-            .flatten()
-            .collect(),
+pub fn complete_response<'a>(
+    status: StatusCode,
+    extra_fileds: Vec<Field>,
+    body: Vec<u8>,
+) -> CompleteResponse {
+    let mut fields = Fields {
+        values: vec![
+            Field::Date(Local::now().into()),
+            Field::Server(server_name()),
+        ],
+    };
+
+    if !body.is_empty() {
+        fields.push(Field::ContentLength(body.len().try_into().unwrap()));
+    }
+
+    fields.extend(extra_fileds);
+
+    CompleteResponse {
+        response: Response {
+            version: Version::HTTP11,
+            status,
+            reason: Some(status.reason().to_owned()),
+            fields,
         },
-        body,
+        body: Complete(body.into_boxed_slice()),
     }
 }
 
+/// 400
+pub fn bad_request(msg: &str) -> CompleteResponse {
+    simplified_response(BadRequest, msg.as_bytes().into())
+}
+
 /// 404
-pub fn not_found<'a>(msg: &str) -> ResponseBuf {
-    error_response(NotFound, msg.as_bytes().into())
+pub fn not_found<'a>(msg: &str) -> CompleteResponse {
+    simplified_response(NotFound, msg.as_bytes().into())
 }
 
 /// 405
-pub fn method_not_allowed<'a>() -> ResponseBuf {
-    error_response(MethodNotAllowed, b"".into())
+pub fn method_not_allowed<'a>(msg: &str) -> CompleteResponse {
+    simplified_response(MethodNotAllowed, msg.as_bytes().into())
+}
+
+/// 406
+pub fn not_acceptable<'a>() -> CompleteResponse {
+    simplified_response(NotAcceptable, Box::new([]))
+}
+
+///  408
+pub fn request_timeout(msg: &str) -> CompleteResponse {
+    simplified_response(
+        RequestTimeout,
+        msg
+            .as_bytes()
+            .into(),
+    )
+}
+
+/// 411
+#[allow(unused)]
+pub fn length_required() -> CompleteResponse {
+    simplified_response(LengthRequired, Box::new([]))
+}
+
+/// 413
+pub fn content_too_large() -> CompleteResponse {
+    simplified_response(ContentTooLarge, Box::new([]))
 }
 
 /// 500
-pub fn internal(msg: &str) -> ResponseBuf {
-    error_response(InternalServerError, msg.as_bytes().into())
+pub fn internal(msg: &str) -> CompleteResponse {
+    simplified_response(InternalServerError, msg.as_bytes().into())
 }
 
-fn server_name() -> ServerBuf {
-    Server::from_bytes_as(&ByteStr::new(SERVER_NAME).into())
-        .unwrap()
-        .into()
+///
+///
+fn server_name() -> Server {
+    ByteStr::new(SERVER_NAME).parse().unwrap()
 }
 
-fn error_response(status: StatusCode, body: ByteString) -> ResponseBuf {
-    ResponseBuf {
-        version: Version::HTTP11,
-        status,
-        reason: Some(status.reason().to_owned()),
-        fields: FieldsBuf {
-            fields: vec![
-                FieldBuf::Date(Local::now().into()),
-                FieldBuf::Server(server_name()),
-            ],
-        },
-        body,
+fn simplified_response(status: StatusCode, body: Box<[u8]>) -> CompleteResponse {
+    complete_response(status, vec![], body.to_vec())
+}
+
+
+#[cfg(test)]
+mod tests {
+
+    use super::*;
+
+    #[test]
+    fn test_server_name() {
+        let server = server_name();
+
+        println!("{server:#?}");
     }
 }

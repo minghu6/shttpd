@@ -146,6 +146,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
 
 [[package]]
+name = "case_insensitive_string"
+version = "0.2.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1179f30a7e3398749c5c3a1bb5746322458c3a67328acb756e5a8ae3758b9291"
+
+[[package]]
 name = "cc"
 version = "1.2.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -743,15 +749,20 @@ name = "m6bitmap"
 version = "0.1.0"
 
 [[package]]
+name = "m6io"
+version = "0.1.0"
+dependencies = [
+ "m6bitmap",
+ "nom",
+]
+
+[[package]]
 name = "m6parsing"
 version = "0.1.0"
 
 [[package]]
 name = "m6ptr"
 version = "0.1.0"
-dependencies = [
- "m6bitmap",
-]
 
 [[package]]
 name = "m6syn"
@@ -781,6 +792,21 @@ checksum = "8e3e04debbb59698c15bacbb6d93584a8c0ca9cc3213cb423d31f760d8843ce5"
 dependencies = [
  "adler2",
 ]
+
+[[package]]
+name = "nom"
+version = "8.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df9761775871bdef83bee530e60050f7e54b1105350d6884eb0fb4f46c2f9405"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
+name = "nonempty"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "549e471b99ccaf2f89101bec68f4d244457d5a95a9c3d0672e9564124397741d"
 
 [[package]]
 name = "num-conv"
@@ -826,13 +852,16 @@ dependencies = [
 name = "osimodel"
 version = "0.1.0"
 dependencies = [
+ "case_insensitive_string",
  "chrono",
  "cookie",
  "derive_more",
  "flate2",
+ "m6io",
  "m6parsing",
- "m6ptr",
  "m6tobytes",
+ "nom",
+ "nonempty",
  "strum",
  "url",
 ]
@@ -1096,6 +1125,7 @@ dependencies = [
  "futures",
  "log",
  "log4rs",
+ "m6io",
  "m6ptr",
  "osimodel",
  "qstring",
