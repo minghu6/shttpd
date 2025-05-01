@@ -1,11 +1,7 @@
 use chrono::Local;
 use m6io::ByteStr;
 use osimodel::application::http::{
-    Body::Complete,
-    CompleteResponse, Connection, ConnectionOption, Field, FieldName, Fields,
-    Response, Server,
-    StatusCode::{self, *},
-    Version,
+    Body::{ Complete, Chunked }, CompleteResponse, Connection, ConnectionOption, Field, FieldName, Fields, Response, Server, StatusCode::{self, *}, TransferCoding, TransferEncoding, Version
 };
 
 use crate::conf::SERVER_NAME;
@@ -17,10 +13,9 @@ pub fn close(mut complete_response: CompleteResponse) -> CompleteResponse {
         .fields
         .contains(FieldName::Connection)
     {
-        complete_response
-            .response
-            .fields
-            .push(Field::Connection(Connection::new().connection(ConnectionOption::Close) ));
+        complete_response.response.fields.push(Field::Connection(
+            Connection::new().connection(ConnectionOption::Close),
+        ));
     }
 
     complete_response
@@ -36,6 +31,35 @@ pub fn classic_ok<'a>(
     body: Vec<u8>,
 ) -> CompleteResponse {
     complete_response(Ok, extra_fileds, body)
+}
+
+pub fn chunked_ok<'a>(
+    extra_fileds: Vec<Field>,
+) -> CompleteResponse {
+    let status = StatusCode::Ok;
+
+    let mut fields = Fields {
+        values: vec![
+            Field::Date(Local::now().into()),
+            Field::Server(server_name()),
+            Field::TransferEncoding(
+                TransferEncoding::new()
+                    .transfer_coding(TransferCoding::chunked()),
+            ),
+        ],
+    };
+
+    fields.extend(extra_fileds);
+
+    CompleteResponse {
+        response: Response {
+            version: Version::HTTP11,
+            status,
+            reason: Some(status.reason().to_owned()),
+            fields,
+        },
+        body: Chunked,
+    }
 }
 
 pub fn complete_response<'a>(
@@ -89,12 +113,7 @@ pub fn not_acceptable<'a>() -> CompleteResponse {
 
 ///  408
 pub fn request_timeout(msg: &str) -> CompleteResponse {
-    simplified_response(
-        RequestTimeout,
-        msg
-            .as_bytes()
-            .into(),
-    )
+    simplified_response(RequestTimeout, msg.as_bytes().into())
 }
 
 /// 411
@@ -119,7 +138,10 @@ fn server_name() -> Server {
     ByteStr::new(SERVER_NAME).parse().unwrap()
 }
 
-fn simplified_response(status: StatusCode, body: Box<[u8]>) -> CompleteResponse {
+fn simplified_response(
+    status: StatusCode,
+    body: Box<[u8]>,
+) -> CompleteResponse {
     complete_response(status, vec![], body.to_vec())
 }
 

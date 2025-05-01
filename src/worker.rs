@@ -1,15 +1,14 @@
 use std::{
     io::{Cursor, ErrorKind, IoSlice, Read, Write},
     net::{Ipv4Addr, Shutdown, SocketAddrV4, TcpListener, TcpStream},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use futures::executor::ThreadPool;
 use log::{error, trace, warn};
-use m6io::{ByteStr, ByteString, Pattern, WriteIntoBytes};
+use m6io::{ByteStr, WriteIntoBytes};
 use osimodel::application::http::{
-    Body, Chunk, ChunkHeader, CompleteRequest, CompleteResponse, Fields,
-    Request, StartLine,
+    Body, Chunk, ChunkHeader, CompleteRequest, CompleteResponse, Fields, Request, Response, StartLine
 };
 
 use crate::{
@@ -26,6 +25,7 @@ pub struct Secondment<'a> {
     buffer: &'a mut [u8],
     filled: usize,
     read: usize,
+    write_chunks: Option<Box<dyn Iterator<Item = Chunk> + 'a>>
 }
 
 // struct Watch {
@@ -62,6 +62,7 @@ impl<'a> Secondment<'a> {
         }
     }
 
+    #[allow(unused)]
     fn discard_buffer(&mut self) {
         self.read = 0;
         self.filled = 0;
@@ -90,6 +91,10 @@ impl<'a> Secondment<'a> {
         self.filled = self.filled - self.read;
         self.read = 0;
     }
+
+    pub(crate) fn set_write_chunks(&mut self, write_chunks: Box<dyn Iterator<Item = Chunk> + 'a>) {
+        self.write_chunks = Some(write_chunks)
+    }
 }
 
 impl<'a> Secondment<'a> {
@@ -103,13 +108,12 @@ impl<'a> Secondment<'a> {
             Err(bad_request("no start-line (endswith CRLF)"))?
         };
 
-        let start_line =
-            match ByteStr::new(&buf[..startline_epos]).parse::<StartLine>() {
-                Ok(startline) => startline,
-                Err(err) => {
-                    Err(bad_request(&format!("invalid start-line for {err}")))?
-                }
-            };
+        let start_line = match buf[..startline_epos].parse::<StartLine>() {
+            Ok(startline) => startline,
+            Err(err) => {
+                Err(bad_request(&format!("invalid start-line for {err}")))?
+            }
+        };
 
         dbg!(&start_line);
 
@@ -118,7 +122,7 @@ impl<'a> Secondment<'a> {
             Err(bad_request(&format!("found status-line {start_line:#?}")))?
         };
 
-        let Some(fields_epos) = ByteStr::new(buf).find(b"\r\n\r\n")
+        let Some(fields_epos) = buf.find(b"\r\n\r\n")
         else {
             Err(bad_request("no fields (\"\r\n\r\n\")"))?
         };
@@ -138,7 +142,7 @@ impl<'a> Secondment<'a> {
         dbg!(&buf[body_spos..]);
 
         let body = if let Some(trans_encoding) = fields.trans_encoding() {
-            if trans_encoding.chunked() {
+            if trans_encoding.is_chunked() {
                 self.consume(body_spos);
 
                 Body::Chunked
@@ -235,7 +239,13 @@ impl<'a> Secondment<'a> {
 
         let data = buf[data_spos..data_epos].to_owned();
 
-        self.consume(data_epos + 2);  // extra CRLF
+        if !header.is_last() {
+            self.consume(data_epos + 2); // extra CRLF
+        }
+        else {
+            self.consume(data_epos);
+            // remains trailer-section CRLF
+        }
 
         Ok(Chunk::from_parts(header, data))
     }
@@ -267,6 +277,33 @@ impl<'a> Secondment<'a> {
         )
     }
 
+    pub(crate) fn read_trailer_section(
+        &mut self,
+    ) -> Result<Fields, CompleteResponse> {
+        let buf = self.unread_buffer();
+
+        dbg!(buf);
+
+        let fields = if let Some(fields_epos) = buf.find(b"\r\n\r\n") {
+            let fields = buf[..fields_epos + 2].parse::<Fields>().map_err(|err| {
+                bad_request(&format!("malformed trailer section for {err:?}"))
+            })?;
+
+            self.consume(fields_epos + 4);
+
+            fields
+        }
+        else if let Some(chunked_body_epos) = buf.find(b"\r\n") {
+            self.consume(chunked_body_epos + 2);
+            Fields::new()
+        }
+        else {
+            Err(bad_request(&format!("no trailer section")))?
+        };
+
+        Ok(fields)
+    }
+
     fn do_read(&mut self, ident: &str) -> Result<usize, CompleteResponse> {
         let n = self.stream.read(&mut self.buffer[self.filled..]).map_err(
             |err| {
@@ -286,89 +323,142 @@ impl<'a> Secondment<'a> {
         Ok(n)
     }
 
-    fn read_exact_on(
-        &mut self,
-        ident: &str,
-        buffer: &mut [u8],
-    ) -> Result<(), CompleteResponse> {
-        if let Err(err) = self.stream.read_exact(buffer) {
-            Err(if err.kind() == ErrorKind::TimedOut {
-                request_timeout(&format!("read {ident} timeout"))
-            }
-            else {
-                bad_request(&format!("uncompleted {ident} for {err}"))
-            })?
-        }
-
-        Ok(())
-    }
-
     fn write_complete_response(
         &mut self,
         complete_response: &CompleteResponse,
     ) -> Result<(), CompleteResponse> {
         let CompleteResponse { response, body } = complete_response;
 
-        if let Body::Complete(body) = body {
-            if body.len() > SERV_CONF.max_body_size as usize {
-                let err_msg = &format!(
-                    "payload exceed limit {}",
-                    SERV_CONF.max_body_size
-                );
+        match body {
+            Body::Empty => todo!(),
+            Body::Complete(body) => {
+                self.write_complete_body(response, &body[..])?;
+            },
+            Body::Chunked => {
+                self.write_chunked_body(response)?;
+            },
+        }
 
-                warn!("{err_msg}");
-                Err(internal(&err_msg))?
-            }
+        Ok(())
+    }
 
-            // debug!("{response:?}");
+    fn write_complete_body(
+        &mut self,
+        response: &Response,
+        body: &[u8],
+    ) -> Result<(), CompleteResponse> {
+        let mut write_buffer = unsafe {
+            Box::<[u8]>::new_uninit_slice(SERV_CONF.max_body_size as usize)
+                .assume_init()
+        };
 
-            let slice0 = match response
-                .write_into_bytes(&mut Cursor::new(&mut self.buffer[..]))
-            {
-                Ok(n) => &self.buffer[..n],
-                Err(err) => Err(internal(&err.to_string()))?,
-            };
+        if body.len() > SERV_CONF.max_body_size as usize {
+            let err_msg = &format!(
+                "payload exceed limit {}",
+                SERV_CONF.max_body_size
+            );
 
-            let slice1 = ByteStr::new(&body[..]);
+            warn!("{err_msg}");
+            Err(internal(&err_msg))?
+        }
 
-            let mut iov =
-                &mut [IoSlice::new(slice0), IoSlice::new(slice1)][..];
+        // debug!("{response:?}");
 
-            // let watch = Watch::start();
+        let slice0 = match response
+            .write_into_bytes(&mut Cursor::new(&mut write_buffer[..]))
+        {
+            Ok(n) => &write_buffer[..n],
+            Err(err) => Err(internal(&err.to_string()))?,
+        };
 
-            /* copy & modifiey from write_all_vectored */
+        let slice1 = ByteStr::new(&body[..]);
 
-            IoSlice::advance_slices(&mut iov, 0);
+        let mut iov =
+            &mut [IoSlice::new(slice0), IoSlice::new(slice1)][..];
 
-            while !iov.is_empty() {
-                match self.stream.write_vectored(iov) {
-                    // Ok(0) => {
-                    //     Err(internal("wait EOF"))?;
-                    // }
-                    Ok(n) => {
-                        // if watch.timeout() {
-                        //     Err(request_timeout())?
-                        // }
+        /* copy & modifiey from write_all_vectored */
 
-                        IoSlice::advance_slices(&mut iov, n)
-                    }
-                    // Err(ref err) if err.kind() == ErrorKind::WouldBlock =>  {
-                    //     if watch.timeout() {
-                    //         Err(request_timeout())?
-                    //     }
-                    // },
-                    Err(ref err) if err.kind() == ErrorKind::TimedOut => {
-                        Err(request_timeout("write response timeout"))?
-                    }
-                    Err(err) => Err(internal(&err.to_string()))?,
+        IoSlice::advance_slices(&mut iov, 0);
+
+        while !iov.is_empty() {
+            match self.stream.write_vectored(iov) {
+                Ok(n) => {
+                    IoSlice::advance_slices(&mut iov, n)
                 }
+                // Err(ref err) if err.kind() == ErrorKind::WouldBlock =>  {
+                //     if watch.timeout() {
+                //         Err(request_timeout())?
+                //     }
+                // },
+                Err(ref err) if err.kind() == ErrorKind::TimedOut => {
+                    Err(request_timeout("write response timeout"))?
+                }
+                Err(err) => Err(internal(&err.to_string()))?,
             }
         }
 
         Ok(())
     }
 
-    fn write_chunks(&mut self) {}
+    fn write_chunked_body(&mut self,
+        response: &Response,
+    ) -> Result<(), CompleteResponse>  {
+        let mut write_buffer = unsafe {
+            Box::<[u8]>::new_uninit_slice(SERV_CONF.max_body_size as usize)
+                .assume_init()
+        };
+
+        let header_buffer = match response
+            .write_into_bytes(&mut Cursor::new(&mut write_buffer[..]))
+        {
+            Ok(n) => &write_buffer[..n],
+            Err(err) => Err(internal(&err.to_string()))?,
+        };
+
+        match self.stream.write(&header_buffer) {
+            Ok(_) => {
+                ()
+            }
+            Err(ref err) if err.kind() == ErrorKind::TimedOut => {
+                Err(request_timeout("write header timeout"))?
+            }
+            Err(err) => Err(internal(&err.to_string()))?,
+        }
+
+        let Some(chunks) = self.write_chunks.take() else {
+            Err(internal("not set write chunks"))?
+        };
+
+        for chunk in chunks {
+            let chunk_buffer = match chunk.write_into_bytes(&mut Cursor::new(&mut write_buffer[..])) {
+                Ok(n) => &write_buffer[..n],
+                Err(err) => Err(internal(&err.to_string()))?,
+            };
+
+            match self.stream.write(&chunk_buffer) {
+                Ok(_) => {
+                    ()
+                }
+                Err(ref err) if err.kind() == ErrorKind::TimedOut => {
+                    Err(request_timeout("write chunk timeout"))?
+                }
+                Err(err) => Err(internal(&err.to_string()))?,
+            }
+        }
+
+        // write no trailer-section
+        match self.stream.write(b"\r\n") {
+            Ok(_) => {
+                ()
+            }
+            Err(ref err) if err.kind() == ErrorKind::TimedOut => {
+                Err(request_timeout("write chunked-body timeout"))?
+            }
+            Err(err) => Err(internal(&err.to_string()))?,
+        }
+
+        Ok(())
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -407,6 +497,7 @@ pub async fn do_work(mut stream: TcpStream) {
         stream: &mut stream,
         read: 0,
         filled: 0,
+        write_chunks: None
     };
 
     /* persistent connection >= HTTP/1.1 */
@@ -424,6 +515,8 @@ pub async fn do_work(mut stream: TcpStream) {
             assist.write_complete_response(&complete_response)
         {
             /* phase-2 write must successful response */
+
+            dbg!(&complete_response_2nd);
 
             complete_response = complete_response_2nd;
 
@@ -450,6 +543,8 @@ pub async fn do_work(mut stream: TcpStream) {
     }
 
     /* clean-up */
+
+    drop(assist);
 
     if let Err(err) = stream.shutdown(Shutdown::Both) {
         error!("shutdown stream: {err}");

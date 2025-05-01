@@ -5,6 +5,7 @@
 #![feature(coroutines)]
 #![feature(async_iterator)]
 #![feature(iter_from_coroutine)]
+#![feature(trait_alias)]
 
 use std::fs::read_to_string;
 

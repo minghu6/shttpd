@@ -8,9 +8,10 @@ use log::info;
 use m6io::ByteString;
 use osimodel::application::{
     http::{
-        Allow, Body, Chunk, Codings, CompleteRequest, CompleteResponse,
-        ContentEncoding, Field, Fields, MediaType, Method::*, Parameters,
-        Request, parameters::ContentCoding,
+        Allow, Body, Chunk, ChunkedBody, Codings, CompleteRequest,
+        CompleteResponse, ContentEncoding, Field, Fields, MediaType,
+        Method::*, Parameters, Request,
+        parameters::ContentCoding,
     },
     mime::{self, TextType},
 };
@@ -19,8 +20,8 @@ use qstring::QString;
 use crate::{
     conf::{CGIMap, SERV_CONF},
     resp::{
-        bad_request, classic_ok, internal, just_ok, method_not_allowed,
-        not_acceptable, not_found,
+        bad_request, chunked_ok, classic_ok, internal, just_ok,
+        method_not_allowed, not_acceptable, not_found,
     },
     worker::Secondment,
 };
@@ -81,6 +82,11 @@ impl<'a> Secondment<'a> {
 
                     load_static(&request)?
                 }
+                else if path == "/chunked-text" {
+                    info!("Get chunked body");
+
+                    send_chunked_text(self, &request)?
+                }
                 else if let Some(cgi_map) = SERV_CONF.cgi.get(path) {
                     info!("Get cgi item: {cgi_map:?}");
 
@@ -125,6 +131,7 @@ impl<'a> Secondment<'a> {
                             collected.push(data.to_vec());
                         }
 
+                        self.read_trailer_section()?;
 
                         just_ok(collected.join(&b"\n"[..]))
                     }
@@ -204,6 +211,37 @@ fn load_static(
         }
         Err(err) => Err(internal(err)),
     }
+}
+
+fn send_chunked_text(
+    sec: &mut Secondment,
+    _request: &Request,
+) -> Result<CompleteResponse, CompleteResponse> {
+    let raw =
+        "两个黄鹂鸣翠柳，一行白鹭上青天。\n窗含西岭千秋雪，门泊东吴万里船。";
+
+    let chunked_body = ChunkedBody::split_as_chunks(raw.as_bytes().into(), 15);
+
+    let stream = std::iter::from_coroutine(
+        #[coroutine]
+        || {
+            let ChunkedBody {
+                chunks,
+                last_chunk,
+                trailer_section: _,
+            } = chunked_body;
+
+            for chunk in chunks {
+                yield chunk;
+            }
+
+            yield last_chunk;
+        },
+    );
+
+    sec.set_write_chunks(Box::new(stream));
+
+    Ok(chunked_ok(vec![]))
 }
 
 fn run_cgi(cgi_map: &CGIMap, q: QString) -> Result<CompleteResponse, String> {

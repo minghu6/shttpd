@@ -27,7 +27,13 @@ recommend `httpie` (python http client terminal app) to test sttpd
 
     `http get 127.0.0.1/log -v`
 
+3. Test Post Chunk
 
+    `http --chunked localhost/post @examples/example-1/chunked_data.txt -v`
+
+4. Test Get CHunk
+
+    ``
 
 ### Debug
 
