@@ -99,6 +99,8 @@ impl<'a> Secondment<'a> {
 
 impl<'a> Secondment<'a> {
     fn resolve_work(&mut self) -> Result<CompleteResponse, CompleteResponse> {
+        // discard remains http request in the buffer
+        self.discard_buffer();
         self.do_read("request")?;
 
         let buf = self.filled_buffer();
@@ -135,11 +137,11 @@ impl<'a> Secondment<'a> {
                 }
             };
 
-        dbg!(&fields);
+        // dbg!(&fields);
 
         let body_spos = fields_epos + 4;
 
-        dbg!(&buf[body_spos..]);
+        // dbg!(&buf[body_spos..]);
 
         let body = if let Some(trans_encoding) = fields.trans_encoding() {
             if trans_encoding.is_chunked() {
@@ -362,8 +364,6 @@ impl<'a> Secondment<'a> {
             Err(internal(&err_msg))?
         }
 
-        // debug!("{response:?}");
-
         let slice0 = match response
             .write_into_bytes(&mut Cursor::new(&mut write_buffer[..]))
         {
@@ -480,12 +480,6 @@ pub async fn do_work(mut stream: TcpStream) {
         error!("[Set Write Timeout]: {err}");
         return;
     }
-
-    // // avoid block when buffer is filled fully
-    // if let Err(err) = stream.set_nonblocking(true) {
-    //     error!("[Set Nonblocking]: {err}");
-    //     return;
-    // }
 
     let mut buffer = unsafe {
         Box::<[u8]>::new_uninit_slice(SERV_CONF.max_header_size as usize)
