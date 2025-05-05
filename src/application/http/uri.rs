@@ -11,11 +11,13 @@ use m6io::{
     nom::{
         AsByte,
         byte::{
-            alpha, byte, digit, digit1, hexdig, one_of,
-            satisfy,
+            alpha, byte, digit, digit1, hexdig, one_of, safe_as_str_parse,
+            safe_to_opt_string, safe_to_string, satisfy,
         },
-        empty, on_guard_many_m_n, on_guard_many0, on_guard_many1,
-        on_guard_opt, safe_as_str_parse, safe_to_opt_string, safe_to_string,
+        combinator::{
+            empty, on_guard_many_m_n, on_guard_many0, on_guard_many1,
+            on_guard_opt,
+        },
     },
 };
 use nom::{
@@ -416,10 +418,7 @@ where
     I::Item: AsByte,
 {
     map(
-        recognize((
-            alpha,
-            on_guard_many0(alt((alpha, digit, one_of("+-.")))),
-        )),
+        recognize((alpha, on_guard_many0(alt((alpha, digit, one_of("+-.")))))),
         // scheme has sentinel for unknown name so parse never fail
         |s| safe_as_str_parse(s).unwrap(),
     )
@@ -995,5 +994,8 @@ mod tests {
         println!("{:?}", on_guard_opt(query).parse(""));
 
         println!("{:#?}", request_target("/").unwrap());
+
+        println!("{:#?}", request_target("/../../").unwrap());
+
     }
 }

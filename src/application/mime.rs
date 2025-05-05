@@ -29,8 +29,10 @@ pub enum MediaTopType {
 
 /// Refer [IANA](https://www.iana.org/assignments/media-types/media-types.xhtml)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Display)]
+#[strum(ascii_case_insensitive, serialize_all = "lowercase")]
 pub enum MediaType {
-    Application,
+    #[strum(to_string = "application/{0}")]
+    Application(ApplicationType),
     Audio,
     Font,
     Haptics,
@@ -38,24 +40,46 @@ pub enum MediaType {
     #[strum(to_string = "message/{0}")]
     Message(MessageType),
     Model,
-    Multipart,
+    #[strum(to_string = "multipart/{0}")]
+    Multipart(MultipartType),
     #[strum(to_string = "text/{0}")]
     Text(TextType),
     Video,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, EnumString, Display)]
-#[strum(ascii_case_insensitive)]
+#[strum(ascii_case_insensitive, serialize_all = "lowercase")]
+#[non_exhaustive]
+pub enum ApplicationType {
+    JSON,
+    XML,
+    #[strum(serialize="xhtml+xml")]
+    XHTMLAXML,
+    OctetStream,
+    #[strum(serialize = "x-www-form-urlencoded")]
+    XWWWFormUrlencoded
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, EnumString, Display)]
+#[strum(ascii_case_insensitive, serialize_all = "lowercase")]
 #[non_exhaustive]
 pub enum TextType {
     /// Plain text.
     Plain,
     /// HTML text.
-    Html,
+    HTML,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, EnumString, Display)]
-#[strum(ascii_case_insensitive)]
+#[strum(ascii_case_insensitive, serialize_all = "lowercase")]
+#[non_exhaustive]
+/// Represents the type of a message.
+pub enum MultipartType {
+    ByteRanges
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, EnumString, Display)]
+#[strum(ascii_case_insensitive, serialize_all = "lowercase")]
 #[non_exhaustive]
 /// Represents the type of a message.
 pub enum MessageType {
@@ -64,3 +88,4 @@ pub enum MessageType {
 
 ////////////////////////////////////////////////////////////////////////////////
 //// Implementations
+

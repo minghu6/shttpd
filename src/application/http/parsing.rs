@@ -15,25 +15,37 @@ use std::{
 };
 
 use m6io::{
+    ALPHA, ByteStr, ConsumeByteStr, DIGIT, FlatCow, FromByteStr, WS,
     nom::{
-        byte::{byte, crlf, digit1, is_digit, is_ws, satisfy, ws}, on_guard_fold_many0, on_guard_many0, on_guard_many1, on_guard_opt, safe_as_str, safe_as_str_parse, safe_to_string, AsByte
-    }, ByteStr, ConsumeByteStr, CowBuf, FlatCow, FromByteStr, ToByteString, ALPHA, DIGIT, WS
+        AsByte,
+        byte::{
+            byte, crlf, digit1, digit1_as_u64, hexdig1, is_digit, safe_as_str,
+            safe_as_str_parse, safe_to_string, satisfy, sp, ws,
+        },
+        combinator::{
+            empty, on_guard_fold_many0, on_guard_fold_many1, on_guard_many0,
+            on_guard_many1, on_guard_opt,
+        },
+    },
 };
 use nom::{
     AsBytes, Compare, Err, IResult, Input, Offset, Parser,
     branch::alt,
     bytes::{tag, tag_no_case, take_while_m_n},
-    combinator::{complete, map, map_res, opt, recognize, verify},
-    error::{Error, ErrorKind, ParseError},
+    combinator::{map, map_res, opt, recognize, value, verify},
+    error::Error,
     sequence::{delimited, preceded, separated_pair, terminated},
 };
-use stringcase::train_case;
+use nonempty::NonEmpty;
+use strum::IntoEnumIterator;
 
 use super::{
     uri::{host as uri_host, port, request_target},
     *,
 };
-use crate::application::mime::{MediaTopType, MessageType, TextType};
+use crate::application::mime::{
+    ApplicationType, MediaTopType, MessageType, MultipartType, TextType,
+};
 
 ////////////////////////////////////////////////////////////////////////////////
 //// Macros
@@ -89,6 +101,13 @@ macro_rules! CTEXT {
     };
 }
 
+/// VCHAR except double quotes, plus obs-text
+macro_rules! ETAGC {
+    () => {
+        0x21 | 0x23..=0x7E | OBS_TEXT![]
+    };
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 //// Constants
 
@@ -104,32 +123,44 @@ trait LiftFieldValue<'a>: Sized {
     ) -> RawParseResult<Self>;
 }
 
-
 ////////////////////////////////////////////////////////////////////////////////
 //// Structures
 
-struct MaybeString {
-    value: Option<String>,
-}
-
-type RawFields<'a> = HashMap<FieldName, NonEmpty<RawFieldValue<'a>>>;
+pub type RawFields<'a> = HashMap<FieldName, NonEmpty<RawFieldValue<'a>>>;
 
 #[derive(Deref)]
 #[deref(forward)]
-struct RawFieldValue<'a> {
+pub struct RawFieldValue<'a> {
     value: FlatCow<'a, ByteStr>,
 }
 
-type RawParseResult<T> = Result<T, Err<Error<ByteString>>>;
+type RawParseResult<T> = Result<T, ByteString>;
 
-#[derive(Deref)]
-#[deref(forward)]
-struct RawFieldValues<'a> {
-    value: NonEmpty<RawFieldValue<'a>>,
+#[derive(Debug)]
+pub struct ParseError {
+    pub input: ByteString,
+    pub kind: ParseErrorKind,
 }
+
+#[derive(Debug)]
+pub enum ParseErrorKind {
+    StartLine,
+    Fields,
+    Field(FieldName),
+}
+
+////////////////////////////////////////
+//// Inner Structures
+
 
 ////////////////////////////////////////////////////////////////////////////////
 //// Implementations
+
+impl Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self:#?}")
+    }
+}
 
 impl<'a> Debug for RawFieldValue<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -137,6 +168,30 @@ impl<'a> Debug for RawFieldValue<'a> {
             Ok(s) => write!(f, "{s}"),
             Err(_) => write!(f, "[non-utf8-compatiable-data]"),
         }
+    }
+}
+
+impl<'a> LiftFieldValue<'a> for AcceptEncoding {
+    fn lift(
+        raw_field_values: NonEmpty<RawFieldValue<'a>>,
+    ) -> RawParseResult<Self> {
+        fold_map_parser_field_list(
+            &field_list_based(&raw_field_values)?,
+            (codings, on_guard_opt(weight)),
+            |values| Self { values },
+        )
+    }
+}
+
+impl<'a> LiftFieldValue<'a> for TransferEncoding {
+    fn lift(
+        raw_field_values: NonEmpty<RawFieldValue<'a>>,
+    ) -> RawParseResult<Self> {
+        fold_map_parser_field_list(
+            &field_list_based(&raw_field_values)?,
+            transfer_coding,
+            |value| TransferEncoding { value },
+        )
     }
 }
 
@@ -152,7 +207,11 @@ impl<'a> LiftFieldValue<'a> for AcceptCharset {
     fn lift(
         raw_field_values: NonEmpty<RawFieldValue<'a>>,
     ) -> RawParseResult<Self> {
-        todo!()
+        fold_map_parser_field_list(
+            &field_list_based(&raw_field_values)?,
+            (charset, on_guard_opt(weight)),
+            |values| Self { values },
+        )
     }
 }
 
@@ -162,7 +221,7 @@ impl<'a> LiftFieldValue<'a> for Accept {
     ) -> RawParseResult<Self> {
         fold_map_parser_field_list(
             &field_list_based(&raw_field_values)?,
-            (media_range, weight),
+            (media_range, on_guard_opt(weight)),
             |values| Self { values },
         )
     }
@@ -173,10 +232,70 @@ impl<'a> LiftFieldValue<'a> for Connection {
         raw_field_values: NonEmpty<RawFieldValue<'a>>,
     ) -> RawParseResult<Self> {
         fold_map_res_field_list(
-            field_list_based(&raw_field_values)?,
+            &field_list_based(&raw_field_values)?,
             |v| safe_as_str_parse(v.deref()),
             |value| Connection { value },
         )
+    }
+}
+
+impl<'a> LiftFieldValue<'a> for Date {
+    fn lift(
+        raw_field_values: NonEmpty<RawFieldValue<'a>>,
+    ) -> RawParseResult<Self> {
+        map_res_singleton(&raw_field_values, |s| s.deref().parse())
+    }
+}
+
+impl<'a> LiftFieldValue<'a> for IfMatch {
+    fn lift(
+        raw_field_values: NonEmpty<RawFieldValue<'a>>,
+    ) -> RawParseResult<Self> {
+        let mut vec = Vec::new();
+
+        for value in raw_field_values {
+            let (_, it) = if_match(value.deref())
+                .map_err(|_err| value.deref().to_owned())?;
+
+            match it {
+                IfMatch::Star => return Ok(it),
+                IfMatch::List(entity_tags) => vec.extend(entity_tags),
+            }
+        }
+
+        Ok(IfMatch::List(vec))
+    }
+}
+
+impl<'a> LiftFieldValue<'a> for IfRange {
+    fn lift(
+        raw_field_values: NonEmpty<RawFieldValue<'a>>,
+    ) -> RawParseResult<Self> {
+        map_res_singleton(&raw_field_values, |s| s.deref().parse())
+    }
+}
+
+impl<'a> LiftFieldValue<'a> for RangesSpecifier {
+    fn lift(
+        raw_field_values: NonEmpty<RawFieldValue<'a>>,
+    ) -> RawParseResult<Self> {
+        map_parser_singleton(&raw_field_values, ranges_specifier)
+    }
+}
+
+impl<'a> LiftFieldValue<'a> for ContentRange {
+    fn lift(
+        raw_field_values: NonEmpty<RawFieldValue<'a>>,
+    ) -> RawParseResult<Self> {
+        map_parser_singleton(&raw_field_values, content_range)
+    }
+}
+
+impl<'a> LiftFieldValue<'a> for AcceptRanges {
+    fn lift(
+        raw_field_values: NonEmpty<RawFieldValue<'a>>,
+    ) -> RawParseResult<Self> {
+        map_parser_singleton(&raw_field_values, accecpt_ranges)
     }
 }
 
@@ -188,61 +307,139 @@ impl<'a> LiftFieldValue<'a> for MediaType {
     }
 }
 
+impl<'a> LiftFieldValue<'a> for Server {
+    fn lift(
+        raw_field_values: NonEmpty<RawFieldValue<'a>>,
+    ) -> RawParseResult<Self> {
+        map_res_singleton(&raw_field_values, |raw| {
+            let (it, _i) = Server::consume_bstr(raw.deref())
+                .map_err(|_| raw.deref().to_owned())?;
+
+            Ok::<_, ByteString>(it)
+        })
+    }
+}
+
+impl<'a> LiftFieldValue<'a> for UserAgent {
+    fn lift(
+        raw_field_values: NonEmpty<RawFieldValue<'a>>,
+    ) -> RawParseResult<Self> {
+        map_res_singleton(&raw_field_values, |raw| {
+            let (it, _i) = UserAgent::consume_bstr(raw.deref())
+                .map_err(|_| raw.deref().to_owned())?;
+
+            Ok::<_, ByteString>(it)
+        })
+    }
+}
+
 ///
 /// ```abnf
 /// *( field-line CRLF )
 /// ```
 ///
 impl FromByteStr for Fields {
-    type Err = nom::error::Error<ByteString>;
+    type Err = ParseError;
 
     fn from_bstr(bytes: &ByteStr) -> Result<Self, Self::Err> {
-        fn lift_fields(raw_fields: RawFields) -> Result<Fields, ()> {
+        fn lift_fields(
+            raw_fields: RawFields,
+        ) -> Result<Fields, (ByteString, FieldName)> {
             let mut fields = Vec::new();
 
-            // for (raw_field_name, raw_field_value) in raw_fields.into_iter() {
-            //     let field_name = raw_field_name.parse::<FieldName>().unwrap();
+            for (field_name, field_values) in raw_fields.into_iter() {
+                let field_value = match &field_name {
+                    FieldName::Accept => Field::Accept(
+                        Accept::lift(field_values)
+                            .map_err(|err| (err, field_name))?,
+                    ),
+                    FieldName::AcceptEncoding => Field::AcceptEncoding(
+                        AcceptEncoding::lift(field_values)
+                            .map_err(|err| (err, field_name))?,
+                    ),
+                    FieldName::TransferEncoding => Field::TransferEncoding(
+                        TransferEncoding::lift(field_values)
+                            .map_err(|err| (err, field_name))?,
+                    ),
+                    FieldName::Connection => Field::Connection(
+                        Connection::lift(field_values)
+                            .map_err(|err| (err, field_name))?,
+                    ),
+                    FieldName::ContentType => Field::ContentType(
+                        ContentType::lift(field_values)
+                            .map_err(|err| (err, field_name))?,
+                    ),
+                    FieldName::Date => Field::Date(
+                        HTTPDate::lift(field_values)
+                            .map_err(|err| (err, field_name))?,
+                    ),
+                    FieldName::Host => Field::Host(
+                        Host::lift(field_values)
+                            .map_err(|err| (err, field_name))?,
+                    ),
+                    FieldName::IfMatch => Field::IfMatch(
+                        IfMatch::lift(field_values)
+                            .map_err(|err| (err, field_name))?,
+                    ),
+                    FieldName::IfNoneMatch => Field::IfNoneMatch(
+                        IfMatch::lift(field_values)
+                            .map_err(|err| (err, field_name))?,
+                    ),
+                    FieldName::IfModifiedSince => Field::IfModifiedSince(
+                        HTTPDate::lift(field_values)
+                            .map_err(|err| (err, field_name))?,
+                    ),
+                    FieldName::IfUnmodifiedSince => Field::IfUnmodifiedSince(
+                        HTTPDate::lift(field_values)
+                            .map_err(|err| (err, field_name))?,
+                    ),
+                    FieldName::IfRange => Field::IfRange(
+                        IfRange::lift(field_values)
+                            .map_err(|err| (err, field_name))?,
+                    ),
+                    FieldName::Server => Field::Server(
+                        Server::lift(field_values)
+                            .map_err(|err| (err, field_name))?,
+                    ),
+                    FieldName::UserAgent => Field::UserAgent(
+                        UserAgent::lift(field_values)
+                            .map_err(|err| (err, field_name))?,
+                    ),
+                    FieldName::NonStandard(..) => {
+                        Field::NonStandard(RawField {
+                            name: field_name.to_string(),
+                            value: field_values
+                                .into_iter()
+                                .map(|RawFieldValue { value, .. }| {
+                                    value.into_owned()
+                                })
+                                .collect::<Vec<_>>(),
+                        })
+                    }
+                    name => todo!("{name}"),
+                };
 
-            //     let field_value = match &field_name {
-            //         FieldName::Connection => {
-            //             Field::Connection(Connection::lift(raw_field_value)?)
-            //         }
-            //         FieldName::Host => {
-            //             Field::Host(Host::lift(raw_field_value)?)
-            //         }
-            //         FieldName::ContentType => {
-            //             Field::ContentType(MediaType::lift(raw_field_value)?)
-            //         }
-            //         FieldName::NonStandard(..) => {
-            //             Field::NonStandard(RawField {
-            //                 name: raw_field_name.into_owned(),
-            //                 value: raw_field_value
-            //                     .into_iter()
-            //                     .map(|RawFieldValue { value, .. }| {
-            //                         value.into_owned()
-            //                     })
-            //                     .collect::<Vec<_>>(),
-            //             })
-            //         }
-            //         _ => todo!(),
-            //     };
+                fields.push(field_value);
+            }
 
-            //     fields.push(field_value);
-            // }
-
-            Ok(Fields { fields })
+            Ok(Fields { values: fields })
         }
 
-        let (i, raw_fields) =
+        let (_i, raw_fields) =
             field_lines.parse_complete(bytes).map_err(|err| match err {
                 Err::Incomplete(..) => unreachable!(),
-                Err::Error(error) | Err::Failure(error) => Error {
+                Err::Error(error) | Err::Failure(error) => ParseError {
                     input: error.input.to_owned(),
-                    code: error.code,
+                    kind: ParseErrorKind::Fields,
                 },
             })?;
 
-        Ok::<Self, Self::Err>(lift_fields(raw_fields).unwrap())
+        Ok(lift_fields(raw_fields).map_err(|(input, field_name)| {
+            ParseError {
+                input,
+                kind: ParseErrorKind::Field(field_name),
+            }
+        })?)
     }
 }
 
@@ -357,6 +554,25 @@ impl FromByteStr for StartLine {
             }};
         }
 
+        struct MaybeString {
+            value: Option<String>,
+        }
+
+        impl FromStr for MaybeString {
+            type Err = Infallible;
+
+            fn from_str(s: &str) -> Result<Self, Self::Err> {
+                Ok(Self {
+                    value: if s.is_empty() {
+                        Some(s.to_owned())
+                    }
+                    else {
+                        None
+                    },
+                })
+            }
+        }
+
         enum State {
             Start,
             H,
@@ -381,15 +597,17 @@ impl FromByteStr for StartLine {
             };
         }
 
-        dbg!("{}", bytes.decode_as_utf8().unwrap());
-
         while i < bytes.len() {
             // startline is case-sensive
             state = match (state, bytes[i]) {
                 // status line (response)
-                (Start, b'H') => H,
+                (Start, b'H') => {
+                    i += 1;
+
+                    H
+                }
                 (Start, b'O') => {
-                    consume!(s = b"Options" ? Method);
+                    consume!(s = b"OPTIONS" ? Method);
 
                     Request {
                         method: Method::Options,
@@ -429,28 +647,28 @@ impl FromByteStr for StartLine {
 
                     Response { version }
                 }
-                (H, b'e') => {
+                (H, b'E') => {
                     consume!(s = b"EAD" ? Method);
 
                     Request {
                         method: Method::Head,
                     }
                 }
-                (P, b'o') => {
+                (P, b'O') => {
                     consume!(s = b"OST" ? Method);
 
                     Request {
                         method: Method::Post,
                     }
                 }
-                (P, b'u') => {
+                (P, b'U') => {
                     consume!(s = b"UT" ? Method);
 
                     Request {
                         method: Method::Put,
                     }
                 }
-                (P, b'a') => {
+                (P, b'A') => {
                     consume!(s = b"ATCH" ? Method);
 
                     Request {
@@ -502,14 +720,6 @@ impl FromByteStr for StartLine {
     }
 }
 
-// impl FromStr for StartLine {
-//     type Err = String;
-
-//     fn from_str(s: &str) -> Result<Self, Self::Err> {
-//         ByteStr::new(s.as_bytes()).parse()
-//     }
-// }
-
 impl FromByteStr for ConnectionOption {
     type Err = String;
 
@@ -524,88 +734,41 @@ impl FromByteStr for ConnectionOption {
 
 impl FromByteStr for ChunkHeader {
     type Err = String;
+
     fn from_bstr(bytes: &ByteStr) -> Result<Self, Self::Err> {
-        let mut i = 0;
+        let (_i, (size, ext)) = (chunk_size, chunk_ext)
+            .parse_complete(bytes)
+            .map_err(|err| err.to_string())?;
 
-        // let (size, offset) = consume_hexdigits_u32(bytes)
-        //     .map_err(|err| format!("parse chunk size failed for {err}"))?;
-
-        // i += offset;
-
-        // let ext = bytes[i..].parse::<ChunkExt>()?;
-
-        // Ok(Self { size, ext })
-
-        todo!()
+        Ok(Self { size, ext })
     }
 }
 
-impl FromByteStr for ChunkExt {
+impl FromByteStr for MediaType {
     type Err = String;
 
     fn from_bstr(bytes: &ByteStr) -> Result<Self, Self::Err> {
-        use State::*;
+        let (_i, it) = media_type(bytes).map_err(|err| err.to_string())?;
 
-        let mut i = 0;
-        let mut ext = Self::new();
-        let mut state = Start;
+        Ok(it)
+    }
+}
 
-        enum State {
-            Start,
-            AfterSemi,
-            AfterExtName(String),
+impl FromByteStr for IfRange {
+    type Err = String;
+
+    fn from_bstr(bytes: &ByteStr) -> Result<Self, Self::Err> {
+        use IfRange::*;
+
+        if let Ok((_i, tag)) = entity_tag(bytes) {
+            Ok(Tag(tag))
         }
-
-        while i < bytes.len() {
-            state = match (state, bytes[i]) {
-                (Start, WS![]) => {
-                    // i += consume_ws(&bytes[i..]);
-                    Start
-                }
-                (Start, b';') => {
-                    i += 1;
-                    AfterSemi
-                }
-                (AfterSemi, WS![]) => {
-                    // i += consume_ws(&bytes[i..]);
-                    AfterSemi
-                }
-                (AfterSemi, TCHAR![]) => {
-                    let (ext_name, offset) = consume_token(&bytes[i..].into());
-                    i += offset;
-                    // i += consume_ws(&bytes[i..]);
-
-                    AfterExtName(ext_name.into_owned())
-                }
-                (AfterExtName(ext_name), b';') => {
-                    ext.push(ValueOrPair::Value(ext_name));
-                    Start
-                }
-                (AfterExtName(ext_name), b'=') => {
-                    i += 1;
-                    // i += consume_ws(&bytes[i..]);
-
-                    let ext_value = bytes[i..].parse::<ParameterValue>()?;
-
-                    ext.push(ValueOrPair::Pair(Parameter {
-                        name: ext_name,
-                        value: ext_value,
-                    }));
-
-                    // i += consume_ws(&bytes[i..]);
-
-                    Start
-                }
-                _ => Err("malformed chunk-ext".to_owned())?,
-            };
+        else if let Ok(date) = bytes.parse::<HTTPDate>() {
+            Ok(Date(date))
         }
-
-        match state {
-            Start | AfterSemi => (), // ignore case
-            AfterExtName(ext_name) => ext.push(ValueOrPair::Value(ext_name)),
+        else {
+            Err(format!("{bytes}"))
         }
-
-        Ok(ext)
     }
 }
 
@@ -618,16 +781,6 @@ impl ConsumeByteStr for RequestTarget {
         Ok((it, bytes.len() - remains.len()))
     }
 }
-
-// impl ConsumeByteStr for Host {
-//     type Err = String;
-
-//     fn consume_bstr(bytes: &ByteStr) -> Result<(Self, usize), Self::Err> {
-//         let it = map_parser_singleton(bytes, host)?;
-
-//         Ok((it, bytes.len() - remains.len()))
-//     }
-// }
 
 impl ConsumeByteStr for mime::MediaRangeType {
     type Err = ();
@@ -694,230 +847,79 @@ impl ConsumeByteStr for mime::MediaRangeType {
     }
 }
 
+impl ConsumeByteStr for UserAgent {
+    type Err = ();
+
+    fn consume_bstr(bytes: &ByteStr) -> Result<(Self, usize), Self::Err> {
+        let (it, offset) = Server::consume_bstr(bytes)?;
+
+        Ok((
+            UserAgent {
+                product: it.product,
+                rem: it.rem,
+            },
+            offset,
+        ))
+    }
+}
+
 impl ConsumeByteStr for Server {
     type Err = ();
 
     fn consume_bstr(bytes: &ByteStr) -> Result<(Self, usize), Self::Err> {
-        let mut i = 0;
+        let (i, it) = server(bytes).map_err(|_| ())?;
 
-        let (product, product_offset) = Product::consume_bstr(bytes)?;
-        i += product_offset;
+        Ok((it, bytes.len() - i.len()))
+    }
+}
 
-        let mut rem = vec![];
+impl FromStr for FieldName {
+    type Err = String;
 
-        while i < bytes.len() {
-            // i += consume_ws(&bytes[i..]);
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (rems, _) =
+            token(s).map_err(|s| format!("{s} is not valid token"))?;
 
-            if bytes[i] == LPAREN {
-                let (comment, comment_offset) =
-                    consume_comment(bytes[i..].into())?;
+        if !rems.is_empty() {
+            Err(format!("rems {rems} is not valid token"))?
+        }
 
-                i += comment_offset;
-
-                rem.push(ProductOrComment::Comment(comment.into_owned()));
+        for name in Self::iter() {
+            if matches!(name, Self::NonStandard(..)) {
+                continue;
             }
-            else {
-                let (product_next, product_next_offset) =
-                    Product::consume_bstr(bytes[i..].into())?;
 
-                i += product_next_offset;
-
-                rem.push(ProductOrComment::Product(product_next));
+            if name.to_string().eq_ignore_ascii_case(s) {
+                return Ok(name);
             }
         }
 
-        Ok((Self { product, rem }, i))
+        Ok(Self::NonStandard(CaseInsensitiveString::new(s)))
     }
 }
 
-impl<'o> ConsumeByteStr for Product {
-    type Err = ();
-
-    fn consume_bstr(bytes: &ByteStr) -> Result<(Self, usize), Self::Err> {
-        let mut i = 0;
-
-        let (name, name_offset) = consume_token(&bytes.into());
-        i += name_offset;
-
-        let version = if bytes[i] == b'/' {
-            i += 1;
-            let (version, version_offset) = consume_token(&bytes[i..].into());
-
-            i += version_offset;
-            Some(version)
-        }
-        else {
-            None
-        };
-
-        Ok((
-            Self {
-                name: name.into_owned(),
-                version: version.map(|v| v.into_owned()),
-            },
-            i,
-        ))
-    }
-}
-
-impl ConsumeByteStr for MediaType {
-    type Err = ();
-
-    fn consume_bstr(bytes: &ByteStr) -> Result<(Self, usize), Self::Err> {
-        macro_rules! throw {
-            () => {
-                Err(())?
-            };
-        }
-
-        let Some(dpos) = bytes.iter().position(|b| *b == b'/')
-        else {
-            throw!()
-        };
-
-        let Some(e_offset) = bytes[dpos + 1..].iter().position(|b| match *b {
-            TCHAR![] => false,
-            _ => true,
-        })
-        else {
-            throw!()
-        };
-
-        let epos = dpos + 1 + e_offset;
-
-        let mime = match bytes[..dpos]
-            .decode_as_utf8()
-            .unwrap()
-            .to_lowercase()
-            .as_str()
-        {
-            "application" => unimplemented!(),
-            "text" => mime::MediaType::Text(
-                bytes[dpos + 1..epos]
-                    .decode_as_utf8()
-                    .unwrap()
-                    .parse()
-                    .map_err(|_| ())?,
-            ),
-            "audio" | "font" | "haptics" | "image" | "message" | "model"
-            | "multipart" | "video" => unimplemented!(),
-            _ => throw!(),
-        };
-
-        let (parameters, p_offset) =
-            Parameters::consume_bstr(&bytes[epos..]).map_err(|_| ())?;
-
-        Ok((Self { mime, parameters }, epos + p_offset))
-    }
-}
-
-impl ConsumeByteStr for Parameters {
+impl FromStr for RangeUnit {
     type Err = String;
 
-    fn consume_bstr(bytes: &ByteStr) -> Result<(Self, usize), Self::Err> {
-        use State::*;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (rems, _) =
+            token(s).map_err(|s| format!("{s} is not valid token"))?;
 
-        #[derive(Clone, Copy)]
-        enum State {
-            Start,
-            InPreOWS,
-            InPostOWS,
+        if !rems.is_empty() {
+            Err(format!("rems {rems} is not valid token"))?
         }
 
-        let mut parameters = Parameters::new();
+        for name in Self::iter() {
+            if matches!(name, Self::Custom(..)) {
+                continue;
+            }
 
-        let mut i = 0;
-        let mut pre_i = 0; // for `q`
-        let mut state = Start;
-
-        while i < bytes.len() {
-            state = match (state, bytes[i]) {
-                (Start, WS![]) => {
-                    i += 1;
-
-                    InPreOWS
-                }
-                (Start | InPreOWS, b';') => {
-                    pre_i = i;
-                    i += 1;
-
-                    InPostOWS
-                }
-                (InPreOWS | InPostOWS, WS![]) => {
-                    i += 1;
-
-                    state
-                }
-                (InPostOWS, TCHAR![]) => {
-                    let (param_name, offset) =
-                        consume_token(&bytes[i..].into());
-                    i += offset;
-
-                    // disjoin with optional weight
-                    if param_name == "q" {
-                        i = pre_i;
-                        break;
-                    }
-
-                    if i == bytes.len() {
-                        Err("empty parameter value".to_owned())?;
-                    }
-
-                    let (param_value, offset) =
-                        ParameterValue::consume_bstr(&bytes[i..])?;
-
-                    i += offset;
-
-                    parameters.push(Parameter {
-                        name: param_name.into_owned(),
-                        value: param_value,
-                    });
-
-                    InPreOWS
-                }
-                (_, _) => Err("malformed parameters".to_owned())?,
-            };
+            if name.to_string().eq_ignore_ascii_case(s) {
+                return Ok(name);
+            }
         }
 
-        Ok((parameters, i))
-    }
-}
-
-
-impl ConsumeByteStr for ParameterValue {
-    type Err = String;
-
-    fn consume_bstr(bytes: &ByteStr) -> Result<(Self, usize), Self::Err> {
-        use ParameterValue::*;
-
-        let (pair_value, offset) = if !bytes.is_empty() && bytes[0] == b'"' {
-            let (qstr, offset) = consume_qstr(&bytes.into())
-                .map_err(|_| "malformed quoted-string")?;
-
-            (QStr(qstr.into_owned()), offset)
-        }
-        else {
-            let (token, offset) = consume_token(&bytes.into());
-
-            (Token(token.into_owned()), offset)
-        };
-
-        Ok((pair_value, offset))
-    }
-}
-
-impl ConsumeByteStr for ContentLength {
-    type Err = String;
-
-    fn consume_bstr(bytes: &ByteStr) -> Result<(Self, usize), Self::Err> {
-        let (s, offset) = consume_decimal_str(bytes);
-
-        Ok((
-            Self {
-                value: s.parse::<u64>().map_err(|err| err.to_string())?,
-            },
-            offset,
-        ))
+        Ok(Self::Custom(CaseInsensitiveString::new(s)))
     }
 }
 
@@ -930,21 +932,6 @@ impl FromStr for Server {
         let server = Server::from_bstr(ByteStr::new(bytes))?;
 
         Ok(server)
-    }
-}
-
-impl FromStr for MaybeString {
-    type Err = Infallible;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(Self {
-            value: if s.is_empty() {
-                Some(s.to_owned())
-            }
-            else {
-                None
-            },
-        })
     }
 }
 
@@ -1082,6 +1069,18 @@ impl FromStr for Date {
     }
 }
 
+impl FromByteStr for Date {
+    type Err = ();
+
+    fn from_bstr(bytes: &ByteStr) -> Result<Self, Self::Err> {
+        if let Ok(s) = std::str::from_utf8(bytes) {
+            s.parse()
+        }
+        else {
+            Err(())
+        }
+    }
+}
 
 impl FromStr for Day {
     type Err = ParseIntError;
@@ -1153,6 +1152,586 @@ impl FromStr for RequestTarget {
 
 ////////////////////////////////////////////////////////////////////////////////
 //// Functions
+
+///
+/// ```
+/// use nonempty::nonempty;
+///
+/// use osimodel::application::http::parsing::ranges_specifier;
+/// use osimodel::application::http::*;
+///
+/// let spec = ranges_specifier("bytes= 0-999, 4500-5499, -1000").unwrap().1;
+/// assert_eq!(
+///     spec.unit,
+///     RangeUnit::Bytes
+/// );
+/// assert_eq!(
+///     spec.set,
+///     nonempty![
+///         RangeSpec::IntRange {
+///             start: 0,
+///             end: Some(999)
+///         },
+///         RangeSpec::IntRange {
+///             start: 4500,
+///             end: Some(5499)
+///         },
+///         RangeSpec::SuffixRange {
+///             end: 1000
+///         }
+///     ]
+/// );
+///
+/// ```
+///
+/// ```abnf
+/// ranges-specifier = range-unit "=" range-set
+/// range-set        = OWS 1#range-spec
+/// ```
+///
+pub fn ranges_specifier<I>(input: I) -> IResult<I, RangesSpecifier>
+where
+    I: Input + Offset + AsBytes,
+    I::Item: AsByte,
+{
+    map(
+        separated_pair(
+            range_unit,
+            byte(b'='),
+            preceded(ows, list1(range_spec)),
+        ),
+        |(unit, set)| RangesSpecifier { unit, set },
+    )
+    .parse(input)
+}
+
+///
+/// case-insensive
+///
+/// ```abnf
+/// range-unit = token
+/// ```
+///
+pub fn range_unit<I>(input: I) -> IResult<I, RangeUnit>
+where
+    I: Input + Offset + AsBytes,
+    I::Item: AsByte,
+{
+    map_res(token, safe_as_str_parse).parse(input)
+}
+
+///
+/// ```abnf
+/// range-spec = int-range
+///            / suffix-range
+///            / other-range
+/// ```
+///
+pub fn range_spec<I>(input: I) -> IResult<I, RangeSpec>
+where
+    I: Input + Offset + AsBytes,
+    I::Item: AsByte,
+{
+    use RangeSpec::*;
+
+    alt((
+        map(int_range, |(start, end)| IntRange { start, end }),
+        map(suffix_range, |end| SuffixRange { end }),
+        map(other_range, |i| OtherRange(i)),
+    ))
+    .parse(input)
+}
+
+///
+/// ```abnf
+/// int-range = first-pos "-" [ last-pos ]
+/// first-pos = 1*DIGIT
+/// last-pos  = 1*DIGIT
+/// ```
+///
+pub fn int_range<I>(input: I) -> IResult<I, (u64, Option<u64>)>
+where
+    I: Input + Offset + AsBytes,
+    I::Item: AsByte,
+{
+    separated_pair(digit1_as_u64, byte(b'-'), on_guard_opt(digit1_as_u64))
+        .parse(input)
+}
+
+///
+/// ```abnf
+/// suffix-range  = "-" suffix-length
+/// suffix-length = 1*DIGIT
+/// ```
+///
+pub fn suffix_range<I>(input: I) -> IResult<I, u64>
+where
+    I: Input + Offset + AsBytes,
+    I::Item: AsByte,
+{
+    preceded(byte(b'-'), digit1_as_u64).parse(input)
+}
+
+///
+/// ```abnf
+/// other-range   = 1*( %x21-2B / %x2D-7E )
+/// ; 1*(VCHAR excluding comma)
+/// ```
+///
+pub fn other_range<I>(input: I) -> IResult<I, ByteString>
+where
+    I: Input + AsBytes,
+    I::Item: AsByte,
+{
+    on_guard_fold_many1(
+        satisfy(|b| match b {
+            0x21..=0x2B | 0x2D..=0x7E => true,
+            _ => false,
+        }),
+        ByteString::new,
+        |mut bstr, b: I::Item| {
+            bstr.push(b.as_byte());
+            bstr
+        },
+    )
+    .parse(input)
+}
+
+///
+/// ```abnf
+/// acceptable-ranges = 1#range-unit
+/// ```
+///
+pub fn accecpt_ranges<I>(input: I) -> IResult<I, AcceptRanges>
+where
+    I: Input + Offset + AsBytes,
+    I::Item: AsByte,
+{
+    map(list1(range_unit), |value| AcceptRanges { value }).parse(input)
+}
+
+///
+/// ```
+/// use nonempty::nonempty;
+///
+/// use osimodel::application::http::parsing::content_range;
+/// use osimodel::application::http::*;
+///
+/// assert_eq!(
+///     content_range("bytes 42-1233/1234").unwrap().1,
+///     ContentRange {
+///         unit: RangeUnit::Bytes,
+///         range_or_unsatisfied: RangeOrUnsatisfied::Range(RangeResp {
+///             range: 42..=1233,
+///             complete_length: Some(1234)
+///         })
+///     }
+/// );
+///
+/// assert_eq!(
+///     content_range("bytes 42-1233/*").unwrap().1,
+///     ContentRange {
+///         unit: RangeUnit::Bytes,
+///         range_or_unsatisfied:  RangeOrUnsatisfied::Range(RangeResp {
+///             range: 42..=1233,
+///             complete_length: None
+///         })
+///     }
+/// );
+/// ```
+///
+/// ```abnf
+/// Content-Range = range-unit SP ( range-resp / unsatisfied-range )
+/// ```
+///
+pub fn content_range<I>(input: I) -> IResult<I, ContentRange>
+where
+    I: Input + Offset + AsBytes,
+    I::Item: AsByte,
+{
+    map(
+        separated_pair(
+            range_unit,
+            sp,
+            alt((
+                map(range_resp, |range| RangeOrUnsatisfied::Range(range)),
+                map(digit1_as_u64, |v| RangeOrUnsatisfied::Unsatisfied(v)),
+            )),
+        ),
+        |(unit, range_or_unsatisfied)| ContentRange {
+            unit,
+            range_or_unsatisfied,
+        },
+    )
+    .parse(input)
+}
+
+/// ```abnf
+/// range-resp      = incl-range "/" ( complete-length / "*" )
+/// incl-range      = first-pos "-" last-pos
+/// complete-length = 1*DIGIT
+/// ```
+pub fn range_resp<I>(input: I) -> IResult<I, RangeResp>
+where
+    I: Input + Offset + AsBytes,
+    I::Item: AsByte,
+{
+    map(
+        separated_pair(
+            incl_range,
+            byte(b'/'),
+            alt((map(digit1_as_u64, |v| Some(v)), value(None, byte(b'*')))),
+        ),
+        |(range, complete_length)| RangeResp {
+            range,
+            complete_length,
+        },
+    )
+    .parse(input)
+}
+
+///
+/// ```abnf
+/// incl-range = first-pos "-" last-pos
+/// first-pos  = 1*DIGIT
+/// last-pos   = 1*DIGIT
+/// ```
+///
+pub fn incl_range<I>(input: I) -> IResult<I, RangeInclusive<u64>>
+where
+    I: Input + Offset + AsBytes,
+    I::Item: AsByte,
+{
+    map(
+        separated_pair(digit1_as_u64, byte(b'-'), digit1_as_u64),
+        |(start, end)| start..=end,
+    )
+    .parse(input)
+}
+
+///
+/// for `BWS` to distinguish with parameters parser
+///
+/// ```abnf
+/// transfer-coding    = token *( OWS ";" OWS transfer-parameter )
+/// transfer-parameter = token BWS "=" BWS ( token / quoted-string )
+/// ```
+///
+pub fn transfer_coding<I>(input: I) -> IResult<I, TransferCoding>
+where
+    I: Input + Offset + AsBytes,
+    I::Item: AsByte,
+{
+    map(
+        (
+            map_res(token, |i| safe_as_str_parse(i)),
+            on_guard_fold_many0(
+                preceded((ows, byte(b';'), ows), transfer_parameter),
+                Parameters::new,
+                |params, p| params.parameter(p),
+            ),
+        ),
+        |(coding, parameters)| TransferCoding { coding, parameters },
+    )
+    .parse(input)
+}
+
+/// transfer-parameter = token BWS "=" BWS ( token / quoted-string )
+/// ```
+///
+pub fn transfer_parameter<I>(input: I) -> IResult<I, Parameter>
+where
+    I: Input + Offset + AsBytes,
+    I::Item: AsByte,
+{
+    map(
+        separated_pair(
+            parameter_name,
+            (bws, byte(b'='), bws),
+            parameter_value,
+        ),
+        |(name, value)| Parameter { name, value },
+    )
+    .parse(input)
+}
+
+///
+/// ```abnf
+/// chunk-size = 1*HEXDIG
+/// ```
+///
+pub fn chunk_size<I>(input: I) -> IResult<I, u32>
+where
+    I: Input + Offset + AsBytes,
+    I::Item: AsByte,
+{
+    map_res(hexdig1, |i| u32::from_str_radix(safe_as_str(i), 16)).parse(input)
+}
+
+///
+/// ```abnf
+/// chunk-ext = *( BWS ";" BWS chunk-ext-name [ BWS "=" BWS chunk-ext-val] )
+/// ```
+///
+pub fn chunk_ext<I>(input: I) -> IResult<I, ChunkExt>
+where
+    I: Input + Offset + AsBytes,
+    I::Item: AsByte,
+{
+    on_guard_fold_many0(
+        map(
+            (
+                preceded((bws, byte(b';'), bws), chunk_ext_name),
+                on_guard_opt(preceded((bws, byte(b'='), bws), chunk_ext_val)),
+            ),
+            |(name, value)| ChunkExtUnit { name, value },
+        ),
+        ChunkExt::new,
+        |mut ext, unit| {
+            ext.push(unit);
+            ext
+        },
+    )
+    .parse(input)
+}
+
+///
+/// ```abnf
+/// chunk-ext-name = token
+/// ```
+///
+pub fn chunk_ext_name<I>(input: I) -> IResult<I, String>
+where
+    I: Input + Offset + AsBytes,
+    I::Item: AsByte,
+{
+    map(token, safe_to_string).parse(input)
+}
+
+///
+/// ```abnf
+/// chunk-ext-val = token / quoted-string
+/// ```
+///
+pub fn chunk_ext_val<I>(input: I) -> IResult<I, ParameterValue>
+where
+    I: Input + Offset + AsBytes,
+    I::Item: AsByte,
+{
+    parameter_value.parse(input)
+}
+
+///
+/// ```abnf
+/// charset = ( token / "*" )
+/// ```
+///
+pub fn charset<I>(input: I) -> IResult<I, Charset>
+where
+    I: Input + Offset + AsBytes,
+    I::Item: AsByte,
+{
+    use Charset::*;
+
+    alt((
+        map_res(token, |i: I| {
+            safe_as_str_parse::<_, charset::Charset>(i).map(|it| Spec(it))
+        }),
+        value(Star, byte(b'*')),
+    ))
+    .parse(input)
+}
+
+///
+/// ```
+/// use osimodel::application::http::parsing::entity_tag;
+/// use osimodel::application::http::EntityTag;
+///
+/// assert_eq!(entity_tag(r#""xyzzy""#).map(|(_, v)| v), Ok(EntityTag {
+///     is_weak: false,
+///     opaque_tag: "xyzzy".as_bytes().into()
+/// }));
+///
+/// assert_eq!(entity_tag(r#"W/"xyzzy""#).map(|(_, v)| v), Ok(EntityTag {
+///     is_weak: true,
+///     opaque_tag: "xyzzy".as_bytes().into()
+/// }));
+/// ```
+///
+/// ```abnf
+/// entity-tag = [ weak ] opaque-tag
+/// weak       = %s"W/" ; case-sensitive
+/// ```
+///
+pub fn entity_tag<I>(input: I) -> IResult<I, EntityTag>
+where
+    I: Input + Offset + AsBytes + Compare<&'static str>,
+    I::Item: AsByte,
+{
+    map(
+        (on_guard_opt(tag("W/")), opaque_tag),
+        |(opt_w, opaque_tag)| EntityTag {
+            is_weak: opt_w.is_some(),
+            opaque_tag,
+        },
+    )
+    .parse(input)
+}
+
+///
+/// ```
+/// use osimodel::application::http::parsing::if_match;
+/// use osimodel::application::http::{ IfMatch::*, EntityTag };
+///
+/// assert_eq!(
+///     if_match(r#""xyzzy", "r2d2xxxx", "c3piozzzz""#).unwrap().1,
+///     List(vec![
+///         EntityTag {
+///             is_weak: false,
+///             opaque_tag: "xyzzy".as_bytes().into()
+///         },
+///         EntityTag {
+///             is_weak: false,
+///             opaque_tag: "r2d2xxxx".as_bytes().into()
+///         },
+///         EntityTag {
+///             is_weak: false,
+///             opaque_tag: "c3piozzzz".as_bytes().into()
+///         }]
+///     ),
+/// );
+///
+/// assert_eq!(if_match("*").unwrap().1, Star);
+///
+/// ```
+///
+/// ```abnf
+/// If-Match = "*" / #entity-tag
+/// ```
+///
+pub fn if_match<I>(input: I) -> IResult<I, IfMatch>
+where
+    I: Input + Offset + AsBytes + Compare<&'static str>,
+    I::Item: AsByte,
+{
+    use IfMatch::*;
+
+    alt((
+        value(Star, byte(b'*')),
+        map(list(entity_tag), |vec| List(vec)),
+    ))
+    .parse(input)
+}
+
+///
+/// ```abnf
+/// opaque-tag = DQUOTE *etagc DQUOTE
+/// ```
+///
+pub fn opaque_tag<I>(input: I) -> IResult<I, ByteString>
+where
+    I: Input + Offset + AsBytes,
+    I::Item: AsByte,
+{
+    delimited(
+        byte(b'"'),
+        on_guard_fold_many0(
+            satisfy(|b| matches!(b, ETAGC![])),
+            ByteString::new,
+            |mut s, c: I::Item| {
+                s.push(c.as_byte());
+                s
+            },
+        ),
+        byte(b'"'),
+    )
+    .parse(input)
+}
+
+
+
+///
+/// ```abnf
+/// Server = product *( RWS ( product-or-comment ) )
+/// ```
+///
+pub fn server<I>(input: I) -> IResult<I, Server>
+where
+    I: Input + Offset + AsBytes,
+    I::Item: AsByte,
+{
+    map(
+        (product, on_guard_many0(preceded(rws, product_or_comment))),
+        |(product, rem)| Server { product, rem },
+    )
+    .parse(input)
+}
+
+///
+/// ```abnf
+/// product-or-comment = product / comment
+/// ```
+///
+pub fn product_or_comment<I>(input: I) -> IResult<I, ProductOrComment>
+where
+    I: Input + Offset + AsBytes,
+    I::Item: AsByte,
+{
+    use ProductOrComment::*;
+
+    alt((
+        map(product, |prod| Product(prod)),
+        map(comment, |comm: I| {
+            Comment(ByteStr::new(comm.as_bytes()).to_owned())
+        }),
+    ))
+    .parse(input)
+}
+
+///
+/// ```abnf
+/// product = token ["/" token]
+/// ```
+///
+pub fn product<I>(input: I) -> IResult<I, Product>
+where
+    I: Input + Offset + AsBytes,
+    I::Item: AsByte,
+{
+    map_res(
+        (token, on_guard_opt(preceded(byte(b'/'), token))),
+        |(name, opt_version)| {
+            Ok::<_, Err<Error<I>>>(Product {
+                name: safe_to_string(name),
+                version: opt_version.map(|version| safe_to_string(version)),
+            })
+        },
+    )
+    .parse(input)
+}
+
+///
+/// ```abnf
+/// codings = content-coding / "identity" / "*"
+/// ```
+pub fn codings<I>(input: I) -> IResult<I, Codings>
+where
+    I: Input + Offset + Compare<&'static str> + AsBytes,
+    I::Item: AsByte,
+{
+    use Codings::*;
+
+    alt((
+        value(Star, byte(b'*')),
+        value(Identity, tag_no_case("identity")),
+        map_res(token, |t: I| {
+            Ok::<_, <ContentCoding as FromStr>::Err>(Spec(safe_as_str_parse(
+                t,
+            )?))
+        }),
+    ))
+    .parse(input)
+}
 
 ///
 /// ```abnf
@@ -1239,7 +1818,9 @@ where
             let top_type = top_type.parse::<MediaTopType>()?;
 
             Ok::<mime::MediaType, strum::ParseError>(match top_type {
-                Application => todo!(),
+                Application => mime::MediaType::Application(
+                    sub_type.parse::<ApplicationType>()?,
+                ),
                 Audio => todo!(),
                 Font => todo!(),
                 Haptics => todo!(),
@@ -1248,7 +1829,9 @@ where
                     mime::MediaType::Message(sub_type.parse::<MessageType>()?)
                 }
                 Model => todo!(),
-                Multipart => todo!(),
+                Multipart => mime::MediaType::Multipart(
+                    sub_type.parse::<MultipartType>()?,
+                ),
                 Text => mime::MediaType::Text(sub_type.parse::<TextType>()?),
                 Video => todo!(),
             })
@@ -1298,7 +1881,7 @@ where
 /// field-lines = *( field-line CRLF )
 /// ```
 ///
-fn field_lines<'i, I>(input: I) -> IResult<I, RawFields<'i>>
+pub fn field_lines<'i, I>(input: I) -> IResult<I, RawFields<'i>>
 where
     I: Input + Offset + AsBytes + 'i,
     I::Item: AsByte,
@@ -1475,6 +2058,19 @@ where
 
 ///
 /// ```abnf
+/// token = 1*(tchar / "/")
+/// ```
+///
+pub fn token_with_slash<I>(input: I) -> IResult<I, I>
+where
+    I: Input + Offset,
+    I::Item: AsByte,
+{
+    recognize(on_guard_many1(alt((tchar, recognize(byte(b'/')))))).parse(input)
+}
+
+///
+/// ```abnf
 /// tchar = "!" / "#" / "$" / "%" / "&" / "'" / "*"
 ///       / "+" / "-" / "." / "^" / "_" / "`" / "|" / "~"
 ///       / DIGIT / ALPHA
@@ -1641,8 +2237,7 @@ where
 ///
 pub fn weight<I>(input: I) -> IResult<I, f32>
 where
-    I: Input + Offset + AsBytes,
-    for<'a> I: Compare<&'a str>,
+    I: Input + Offset + AsBytes + Compare<&'static str>,
     I::Item: AsByte,
 {
     preceded((ows, byte(b';'), ows, tag_no_case("q=")), qvalue).parse(input)
@@ -1769,247 +2364,69 @@ where
 }
 
 ///
-/// first byte is double-quote
+/// ```abnf
+/// list = [ list1 ]  ; #f
+/// ```
 ///
-/// return (parsed-bytes (exclude double quote), offset)
-///
-fn consume_qstr<'a>(
-    bytes: &FlatCow<'a, ByteStr>,
-) -> Result<(FlatCow<'a, ByteStr>, usize), ()> {
-    use State::*;
-
-    let mut state = Start;
-    let mut buf = CowBuf::from(bytes);
-
-    #[derive(Clone, Copy)]
-    enum State {
-        Start,
-        InStr,
-        OutStr,
-        Quoting,
-    }
-
-    let mut i = 0;
-
-    while i < bytes.len() {
-        let b = bytes[i];
-
-        state = match (state, b) {
-            (Start, b'"') => {
-                buf.start(i + 1);
-
-                InStr
-            }
-            (
-                InStr,
-                WS![] | 0x21 | 0x23..=0x5b | 0x5d..=0x7e | OBS_TEXT![],
-            ) => {
-                buf.push(b);
-
-                state
-            }
-            (InStr, b'\\') => Quoting,
-            (Quoting, WS![] | VCHAR![] | OBS_TEXT![]) => {
-                buf.clone_push(bytes[i]);
-
-                InStr
-            }
-            (InStr, b'"') => OutStr,
-            _ => break,
-        };
-
-        i += 1;
-    }
-
-    match state {
-        OutStr => Ok((buf.to_cow(), i)),
-        _ => Err(()),
-    }
-}
-
-/// return (str, offset)
-fn consume_token<'a>(
-    bytes: &FlatCow<'a, ByteStr>,
-) -> (FlatCow<'a, str>, usize) {
-    let mut i = 0;
-
-    while i < bytes.len() {
-        match bytes[i] {
-            TCHAR![] => (),
-            _ => break,
-        }
-
-        i += 1;
-    }
-
-    (bytes.as_slice_cow(..i).try_into().unwrap(), i)
-}
-
-
-fn consume_maybe_weight(bytes: &ByteStr) -> Result<Option<(f32, usize)>, ()> {
-    let mut i = 0;
-
-    /* consume maybe space */
-
-    // i += consume_ws(bytes);
-
-    if i < bytes.len() && bytes[i] == Semicolon.to_u8() {
-        i += 1;
-    }
-    else {
-        return Ok(None);
-    }
-
-    // i += consume_ws(bytes);
-
-    if i + 2 < bytes.len()
-        && (&bytes[i..i + 2] == b"q=" || &bytes[i..i + 2] == b"Q=")
-    {
-        i += 2;
-    }
-
-    if i == bytes.len() {
-        Err(())?;
-    }
-
-    let b = bytes[i];
-
-    if b != b'0' && b != b'1' {
-        Err(())?;
-    }
-
-    let mut j = i + 1;
-
-    Ok(Some(if j < bytes.len() && bytes[j] == b'.' {
-        if b == b'0' {
-            while (j - i) <= 3 {
-                match bytes[j] {
-                    b'0'..=b'9' => (),
-                    _ => break,
-                }
-
-                j += 1;
-            }
-
-            (
-                bytes[i..j]
-                    .decode_as_utf8()
-                    .unwrap()
-                    .parse::<f32>()
-                    .map_err(|_| ())?,
-                j,
-            )
+fn list<I, F>(
+    f: F,
+) -> impl Parser<
+    I,
+    Output = Vec<<F as Parser<I>>::Output>,
+    Error = <F as Parser<I>>::Error,
+>
+where
+    I: Input + Offset,
+    F: Parser<I, Error = nom::error::Error<I>> + Copy,
+    I::Item: AsByte,
+{
+    map(on_guard_opt(list1(f)), |opt_nonempty| {
+        if let Some(nonempty) = opt_nonempty {
+            nonempty.into()
         }
         else {
-            while (j - i) <= 3 {
-                if bytes[j] != b'0' {
-                    break;
-                }
-
-                j += 1;
-            }
-
-            (1.0, j)
+            Vec::new()
         }
-    }
-    else {
-        ((b - b'0') as f32, j)
-    }))
+    })
 }
-
-
-fn consume_decimal_str(bytes: &ByteStr) -> (&str, usize) {
-    let mut i = 0;
-
-    while i < bytes.len() {
-        match bytes[i] {
-            DIGIT![] => (),
-            _ => break,
-        }
-
-        i += 1;
-    }
-
-    (bytes[..i].decode_as_utf8().unwrap(), i)
-}
-
-
-/// another impl style (without explicit state)
-fn consume_comment<'a>(
-    bytes: FlatCow<'a, ByteStr>,
-) -> Result<(FlatCow<'a, ByteStr>, usize), ()> {
-    let mut i = 0;
-    let mut cnt = 0;
-    let mut escaping = false;
-    let mut buf = CowBuf::from(&bytes);
-
-    if bytes.is_empty() || bytes[0] != LPAREN {
-        Err(())?
-    }
-
-    buf.start(1);
-
-    for b in bytes.iter().cloned() {
-        if escaping {
-            match b {
-                WS![] | VCHAR![] | OBS_TEXT![] => buf.clone_push(b),
-                _ => Err(())?,
-            }
-
-            escaping = false;
-        }
-        else {
-            match b {
-                b'(' => {
-                    if cnt > 0 {
-                        buf.push(b);
-                    }
-
-                    cnt += 1;
-                }
-                b')' => {
-                    if cnt == 0 {
-                        Err(())?
-                    }
-                    else if cnt == 1 {
-                        i += 2;
-                        break;
-                    }
-                    else {
-                        buf.push(b);
-                        cnt -= 1;
-                    }
-                }
-                b'\\' => {
-                    escaping = true;
-                }
-                CTEXT![] => {
-                    if cnt == 0 {
-                        Err(())?
-                    }
-
-                    buf.push(b);
-                }
-                _ => Err(())?,
-            }
-        }
-
-        i += 1;
-    }
-
-    Ok((buf.to_cow(), i))
-}
-
 
 ///
 /// ```abnf
-/// part = *( comment ) (quoted-string / token) *( comment )
+/// list1 = f *( OWS "," OWS f )  ; 1#f
+/// ```
+///
+fn list1<I, F>(
+    f: F,
+) -> impl Parser<
+    I,
+    Output = NonEmpty<<F as Parser<I>>::Output>,
+    Error = <F as Parser<I>>::Error,
+>
+where
+    I: Input + Offset,
+    F: Parser<I, Error = nom::error::Error<I>> + Copy,
+    I::Item: AsByte,
+{
+    map(
+        (f, on_guard_many0(preceded((ows, byte(b','), ows), f))),
+        |(a, rems)| NonEmpty {
+            head: a,
+            tail: rems,
+        },
+    )
+}
+
+///
+/// filter out empty value
+///
+/// ```abnf
+/// part = *( comment ) [(quoted-string / token)] *( comment )
 /// line = part *( OWS "," OWS part )
 /// ```
 ///
 fn field_list_based<'a>(
     filed_values: &'a NonEmpty<RawFieldValue<'a>>,
-) -> RawParseResult<NonEmpty<RawFieldValue<'a>>> {
+) -> RawParseResult<Vec<RawFieldValue<'a>>> {
     fn part<'a, I>(input: I) -> IResult<I, RawFieldValue<'a>>
     where
         I: Input + Offset + AsBytes,
@@ -2021,12 +2438,15 @@ fn field_list_based<'a>(
                 map(quoted_string, |s| RawFieldValue {
                     value: FlatCow::own_new(s),
                 }),
-                map(token, |i: I| RawFieldValue {
+                map(token_with_slash, |i: I| RawFieldValue {
                     value: unsafe {
                         FlatCow::borrow_new(ByteStr::from_bytes_permanently(
                             i.as_bytes(),
                         ))
                     },
+                }),
+                map(empty, |_| RawFieldValue {
+                    value: FlatCow::own_new(ByteString::new()),
                 }),
             )),
             on_guard_many0(comment),
@@ -2060,26 +2480,21 @@ fn field_list_based<'a>(
 
     for field_value in filed_values {
         let (_i, nonempty) = line(field_value.deref())
-            .map_err(|err| err.map_input(ToOwned::to_owned))?;
+            .map_err(|_err| field_value.deref().to_owned())?;
 
-        members.extend(nonempty);
+        members.extend(nonempty.into_iter().filter(|s| !s.is_empty()));
     }
 
-    Ok(NonEmpty::from_vec(members).unwrap())
+    Ok(members)
 }
 
-fn map_singleton<'a, T, E2>(
+fn map_res_singleton<'a, T, E2>(
     field_values: &'a NonEmpty<RawFieldValue<'a>>,
     mut f: impl FnMut(&RawFieldValue<'a>) -> Result<T, E2>,
 ) -> RawParseResult<T> {
     let input = &field_values.head;
 
-    f(&input).map_err(|_err| {
-        Err::Error(Error {
-            input: input.deref().to_owned(),
-            code: ErrorKind::MapRes,
-        })
-    })
+    f(&input).map_err(|_err| input.deref().to_owned())
 }
 
 fn map_parser_singleton<'a: 'b, 'b, T>(
@@ -2088,51 +2503,43 @@ fn map_parser_singleton<'a: 'b, 'b, T>(
 ) -> RawParseResult<T> {
     let input = &field_values.head;
 
-    let res = parser.parse(input.deref()).map_err(|err| {
-        err.map_input(|i| i.to_bstring())
-    }).map(|(_i, it)| it);
+    let res = parser
+        .parse(input.deref())
+        .map_err(|_err| input.deref().to_owned())
+        .map(|(_i, it)| it);
 
     res
 }
 
 fn fold_map_parser_field_list<'a: 'b, 'b, T, C>(
-    field_values: &'a NonEmpty<RawFieldValue<'a>>,
+    field_values: &'a [RawFieldValue<'a>],
     mut f: impl Parser<&'b ByteStr, Output = T, Error = Error<&'b ByteStr>>,
-    g: impl Fn(NonEmpty<T>) -> C,
+    g: impl Fn(Vec<T>) -> C,
 ) -> RawParseResult<C> {
     let mut vec = Vec::with_capacity(field_values.len());
 
     for v in field_values {
         match f.parse(&v.value.as_ref()) {
-            Ok((_i, it)) => {
-                vec.push(it)
-            }
-            Result::Err(err) => {
-                Err(err.map_input(|i| i.to_bstring()))?
-            },
+            Ok((_i, it)) => vec.push(it),
+            Result::Err(_err) => Err(v.deref().to_owned())?,
         }
     }
 
-    Ok(g(NonEmpty::from_vec(vec).unwrap()))
+    Ok(g(vec))
 }
 
 fn fold_map_res_field_list<'a, T, C, E2>(
-    field_values: NonEmpty<RawFieldValue<'a>>,
+    field_values: &'a [RawFieldValue<'a>],
     mut f: impl FnMut(&RawFieldValue<'a>) -> Result<T, E2>,
-    g: impl Fn(NonEmpty<T>) -> C,
+    g: impl Fn(Vec<T>) -> C,
 ) -> RawParseResult<C> {
     let mut vec = Vec::with_capacity(field_values.len());
 
     for v in field_values {
-        vec.push(f(&v).map_err(|_| {
-            Err::Error(Error {
-                input: v.value.into_owned(),
-                code: ErrorKind::MapRes,
-            })
-        })?)
+        vec.push(f(&v).map_err(|_| v.deref().to_owned())?)
     }
 
-    Ok(g(NonEmpty::from_vec(vec).unwrap()))
+    Ok(g(vec))
 }
 
 
@@ -2142,6 +2549,54 @@ mod tests {
     use m6io::{ToByteString, bstr};
 
     use super::*;
+
+    #[test]
+    fn test_split_list() {
+        fn part<'a, I>(input: I) -> IResult<I, RawFieldValue<'a>>
+        where
+            I: Input + Offset + AsBytes,
+            I::Item: AsByte,
+        {
+            delimited(
+                on_guard_many0(comment),
+                alt((
+                    map(quoted_string, |s| RawFieldValue {
+                        value: FlatCow::own_new(s),
+                    }),
+                    map(token_with_slash, |i: I| RawFieldValue {
+                        value: unsafe {
+                            FlatCow::borrow_new(
+                                ByteStr::from_bytes_permanently(i.as_bytes()),
+                            )
+                        },
+                    }),
+                    map(empty, |_| RawFieldValue {
+                        value: FlatCow::own_new(ByteString::new()),
+                    }),
+                )),
+                on_guard_many0(comment),
+            )
+            .parse(input)
+        }
+
+        let (_i, it) = part(bstr!(b"*/*")).unwrap();
+
+        println!("part: {it:#?}");
+    }
+
+    #[test]
+    fn test_parse_media_range() {
+        let input = bstr!("*/*");
+
+        println!("{:#?}", media_range(input).unwrap());
+    }
+
+    #[test]
+    fn test_parse_transfer_encoding() {
+        let input = bstr!("chunked");
+
+        println!("{:#?}", transfer_coding(input).unwrap());
+    }
 
     #[test]
     fn test_parse_comment() {
@@ -2216,6 +2671,12 @@ mod tests {
         bstr!("GET www.baidu.com HTTP/1.1")
             .parse::<StartLine>()
             .unwrap();
+
+        bstr!("HEAD / HTTP/1.1").parse::<StartLine>().unwrap();
+
+        bstr!("POST / HTTP/1.1").parse::<StartLine>().unwrap();
+
+        bstr!("OPTIONS / HTTP/1.1").parse::<StartLine>().unwrap();
     }
 
     #[test]
@@ -2223,11 +2684,31 @@ mod tests {
         let raw = "Accept: */*\r
 Accept-Encoding: gzip, deflate\r
 Connection: keep-alive\r
+Transfer-Encoding: chunked\r
 Host: localhost\r
 ";
 
-        let raw = ByteStr::new(raw);
+        let input = ByteStr::new(raw);
 
-        // println!("{:?}", alt::<()>((field_vchar, ws)).parse(r"\a"))
+        let (_i, raw_fields) = field_lines(input).unwrap();
+
+        println!("raw_fields: {raw_fields:#?}");
+
+        let ae_field_values =
+            raw_fields.get(&FieldName::AcceptEncoding).unwrap();
+        let ae_field_value_list = field_list_based(ae_field_values).unwrap();
+
+        println!("ae_field_values: {ae_field_values:?}");
+        println!("ae_field_value_list: {ae_field_value_list:?}");
+
+        let a_field_values = raw_fields.get(&FieldName::Accept).unwrap();
+        let a_field_value_list = field_list_based(a_field_values).unwrap();
+
+        println!("a_field_values: {a_field_values:?}");
+        println!("a_field_value_list: {a_field_value_list:?}");
+
+        let fields = Fields::from_bstr(input).unwrap();
+
+        println!("{fields:#?}");
     }
 }

@@ -1,7 +1,4 @@
-use std::{
-    ascii::Char::*,
-    io::Write,
-};
+use std::{ascii::Char::*, io::Write};
 
 use m6io::{CowBuf, WriteIntoBytes};
 
@@ -60,14 +57,19 @@ impl WriteIntoBytes for Fields {
 
         let mut n = 0;
 
-        for field in self.fields.iter() {
+        for field in self.values.iter() {
             n += field.name().to_string().write_into_bytes(w)?;
             n += Colon.to_string().write_into_bytes(w)?;
             n += Space.to_string().write_into_bytes(w)?;
 
             n += match field {
                 Server(server) => server.write_into_bytes(w),
+                UserAgent(user_agent) => user_agent.write_into_bytes(w),
+                Allow(allow) => allow.write_into_bytes(w),
                 Accept(accept) => accept.write_into_bytes(w),
+                AcceptEncoding(accept_encoding) => {
+                    accept_encoding.write_into_bytes(w)
+                }
                 Connection(connection) => connection.write_into_bytes(w),
                 ContentType(media_type) => media_type.write_into_bytes(w),
                 ContentEncoding(content_encoding) => {
@@ -77,7 +79,18 @@ impl WriteIntoBytes for Fields {
                     content_length.to_string().write_into_bytes(w)
                 }
                 Date(date) => date.to_string().write_into_bytes(w),
+                ETag(etag) => etag.write_into_bytes(w),
+                IfMatch(ifmatch) | IfNoneMatch(ifmatch) => {
+                    ifmatch.write_into_bytes(w)
+                }
+                IfModifiedSince(date) | IfUnmodifiedSince(date) => {
+                    date.imf_fixdate().write_into_bytes(w)
+                }
+                IfRange(ifrange) => ifrange.write_into_bytes(w),
                 Host(host) => host.to_string().write_into_bytes(w),
+                Range(range_spec) => range_spec.write_into_bytes(w),
+                ContentRange(content_range)  => content_range.write_into_bytes(w),
+                AcceptRanges(accept_ranges) => accept_ranges.write_into_bytes(w),
                 TransferEncoding(transfer_encoding) => {
                     transfer_encoding.write_into_bytes(w)
                 }
@@ -101,6 +114,204 @@ impl WriteIntoBytes for RawField {
             }
 
             n += member.write_into_bytes(w)?;
+        }
+
+        Ok(n)
+    }
+}
+
+impl WriteIntoBytes for ChunkedBody {
+    fn write_into_bytes<W: Write>(&self, w: &mut W) -> std::io::Result<usize> {
+        let mut n = 0;
+
+        for chunk in self.chunks.iter() {
+            n += chunk.write_into_bytes(w)?;
+        }
+
+        n += self.last_chunk.write_into_bytes(w)?;
+
+        n += self.trailer_section.write_into_bytes(w)?;
+        n += CRLF.write_into_bytes(w)?;
+
+        Ok(n)
+    }
+}
+
+impl WriteIntoBytes for Chunk {
+    fn write_into_bytes<W: Write>(&self, w: &mut W) -> std::io::Result<usize> {
+        let mut n = 0;
+
+        n += format!("{:x}", self.size).write_into_bytes(w)?;
+        n += self.ext.write_into_bytes(w)?;
+        n += CRLF.write_into_bytes(w)?;
+
+        if self.size > 0 {
+            n += self.data.write_into_bytes(w)?;
+            n += CRLF.write_into_bytes(w)?;
+        }
+
+        Ok(n)
+    }
+}
+
+impl WriteIntoBytes for ChunkExt {
+    fn write_into_bytes<W: Write>(&self, w: &mut W) -> std::io::Result<usize> {
+        let mut n = 0;
+
+        for ChunkExtUnit { name, value } in self.iter() {
+            n += Semicolon.as_str().write_into_bytes(w)?;
+            n += name.to_string().write_into_bytes(w)?;
+
+            if let Some(param) = value {
+                n += EqualsSign.as_str().write_into_bytes(w)?;
+                n += param.write_into_bytes(w)?;
+            }
+        }
+
+        Ok(n)
+    }
+}
+
+impl WriteIntoBytes for EntityTag {
+    fn write_into_bytes<W: Write>(&self, w: &mut W) -> std::io::Result<usize> {
+        let mut n = 0;
+
+        if self.is_weak {
+            n += "W/".write_into_bytes(w)?;
+        }
+
+        n += QuotationMark.as_str().write_into_bytes(w)?;
+        n += self.opaque_tag.write_into_bytes(w)?;
+        n += QuotationMark.as_str().write_into_bytes(w)?;
+
+        Ok(n)
+    }
+}
+
+impl WriteIntoBytes for IfMatch {
+    fn write_into_bytes<W: Write>(&self, w: &mut W) -> std::io::Result<usize> {
+        let mut n = 0;
+
+        match self {
+            IfMatch::Star => n += '*'.to_string().write_into_bytes(w)?,
+            IfMatch::List(entity_tags) => {
+                for (i, etag) in entity_tags.iter().enumerate() {
+                    if i != 0 {
+                        n += Comma.to_string().write_into_bytes(w)?;
+                        n += Space.to_string().write_into_bytes(w)?;
+                    }
+
+                    n += etag.write_into_bytes(w)?;
+                }
+            }
+        }
+
+        Ok(n)
+    }
+}
+
+impl WriteIntoBytes for IfRange {
+    fn write_into_bytes<W: Write>(&self, w: &mut W) -> std::io::Result<usize> {
+        let mut n = 0;
+
+        n += match self {
+            IfRange::Tag(entity_tag) => entity_tag.write_into_bytes(w),
+            IfRange::Date(date) => date.imf_fixdate().write_into_bytes(w),
+        }?;
+
+        Ok(n)
+    }
+}
+
+impl WriteIntoBytes for RangesSpecifier {
+    fn write_into_bytes<W: Write>(&self, w: &mut W) -> std::io::Result<usize> {
+        let mut n = 0;
+
+        n += self.unit.to_string().write_into_bytes(w)?;
+        n += EqualsSign.to_string().write_into_bytes(w)?;
+
+        for (i, range_sepc) in self.set.iter().enumerate() {
+            if i != 0 {
+                n += Comma.to_string().write_into_bytes(w)?;
+                n += Space.to_string().write_into_bytes(w)?;
+            }
+
+            n += range_sepc.write_into_bytes(w)?;
+        }
+
+        Ok(n)
+    }
+}
+
+impl WriteIntoBytes for RangeSpec {
+    fn write_into_bytes<W: Write>(&self, w: &mut W) -> std::io::Result<usize> {
+        let mut n = 0;
+
+        match self {
+            RangeSpec::IntRange { start, end } => {
+                n += format!("{start}-").write_into_bytes(w)?;
+
+                if let Some(end) = end {
+                    n += end.to_string().write_into_bytes(w)?;
+                }
+            }
+            RangeSpec::SuffixRange { end } => {
+                n += format!("-{end}").write_into_bytes(w)?;
+            }
+            RangeSpec::OtherRange(byte_string) => n += byte_string.write_into_bytes(w)?,
+        }
+
+        Ok(n)
+    }
+}
+
+impl WriteIntoBytes for AcceptRanges {
+    fn write_into_bytes<W: Write>(&self, w: &mut W) -> std::io::Result<usize> {
+        let mut n = 0;
+
+        for (i, range_unit) in self.iter().enumerate() {
+            if i != 0 {
+                n += Comma.to_string().write_into_bytes(w)?;
+                n += Space.to_string().write_into_bytes(w)?;
+            }
+
+            n += range_unit.to_string().write_into_bytes(w)?;
+        }
+
+        Ok(n)
+    }
+}
+
+impl WriteIntoBytes for ContentRange {
+    fn write_into_bytes<W: Write>(&self, w: &mut W) -> std::io::Result<usize> {
+        let mut n = 0;
+
+        n += self.unit.to_string().write_into_bytes(w)?;
+        n += Space.to_string().write_into_bytes(w)?;
+
+        match &self.range_or_unsatisfied {
+            RangeOrUnsatisfied::Range(range_resp) => {
+                n += range_resp.write_into_bytes(w)?;
+            },
+            RangeOrUnsatisfied::Unsatisfied(len) => n += format!("*/{len}").write_into_bytes(w)?,
+        }
+
+        Ok(n)
+    }
+}
+
+impl WriteIntoBytes for RangeResp {
+    fn write_into_bytes<W: Write>(&self, w: &mut W) -> std::io::Result<usize> {
+        let mut n = 0;
+
+        n += format!("{}-{}", self.range.start(), self.range.end()).write_into_bytes(w)?;
+        n += Solidus.to_string().write_into_bytes(w)?;
+
+        if let Some(len) = self.complete_length {
+            n += len.to_string().write_into_bytes(w)?;
+        }
+        else {
+            n += Asterisk.to_string().write_into_bytes(w)?;
         }
 
         Ok(n)
@@ -202,6 +413,12 @@ impl WriteIntoBytes for Server {
     }
 }
 
+impl WriteIntoBytes for UserAgent {
+    fn write_into_bytes<W: Write>(&self, w: &mut W) -> std::io::Result<usize> {
+        Server::from(self.clone()).write_into_bytes(w)
+    }
+}
+
 impl WriteIntoBytes for Product {
     fn write_into_bytes<W: Write>(&self, w: &mut W) -> std::io::Result<usize> {
         let mut n = self.name.write_into_bytes(w)?;
@@ -215,20 +432,75 @@ impl WriteIntoBytes for Product {
     }
 }
 
+impl WriteIntoBytes for Allow {
+    fn write_into_bytes<W: Write>(&self, w: &mut W) -> std::io::Result<usize> {
+        let mut n = 0;
+
+        for (i, method) in self.iter().enumerate() {
+            if i != 0 {
+                n += Comma.to_string().write_into_bytes(w)?;
+                n += Space.to_string().write_into_bytes(w)?;
+            }
+
+            n += method.to_string().write_into_bytes(w)?;
+        }
+
+        Ok(n)
+    }
+}
+
 impl WriteIntoBytes for Accept {
     fn write_into_bytes<W: Write>(&self, w: &mut W) -> std::io::Result<usize> {
         let mut n = 0;
 
-        for (i, (media_range, q)) in self.iter().enumerate() {
+        for (i, (media_range, opt_q)) in self.iter().enumerate() {
             if i != 0 {
                 n += Comma.to_string().write_into_bytes(w)?;
             }
 
             n += media_range.write_into_bytes(w)?;
-            n += format!(";q={q}").write_into_bytes(w)?;
+
+            if let Some(q) = opt_q {
+                n += format!(";q={q}").write_into_bytes(w)?;
+            }
         }
 
         Ok(n)
+    }
+}
+
+impl WriteIntoBytes for AcceptEncoding {
+    fn write_into_bytes<W: Write>(&self, w: &mut W) -> std::io::Result<usize> {
+        let mut n = 0;
+
+        for (i, (codings, opt_q)) in self.iter().enumerate() {
+            if i != 0 {
+                n += Comma.to_string().write_into_bytes(w)?;
+            }
+
+            n += codings.write_into_bytes(w)?;
+
+            if let Some(q) = opt_q {
+                n += format!(";q={q}").write_into_bytes(w)?;
+            }
+        }
+
+        Ok(n)
+    }
+}
+
+impl WriteIntoBytes for Codings {
+    fn write_into_bytes<W: Write>(&self, w: &mut W) -> std::io::Result<usize> {
+        use Codings::*;
+
+        match self {
+            Spec(content_coding) => content_coding
+                .to_string()
+                .to_ascii_lowercase()
+                .write_into_bytes(w),
+            Identity => "identity".write_into_bytes(w),
+            Star => "*".write_into_bytes(w),
+        }
     }
 }
 
@@ -276,8 +548,7 @@ impl WriteIntoBytes for ParameterValue {
                 let mut n = QuotationMark.as_str().write_into_bytes(w)?;
                 let bstr = byte_string.as_bstr();
 
-                n += escape_qdstr(&bstr.into())
-                    .write_into_bytes(w)?;
+                n += escape_qdstr(&bstr.into()).write_into_bytes(w)?;
                 n += QuotationMark.as_str().write_into_bytes(w)?;
                 n
             }
@@ -315,6 +586,23 @@ impl ToString for Host {
 
 ////////////////////////////////////////////////////////////////////////////////
 //// Functions
+
+// fn write_into_list_based_field_value<W: Write, T: WriteIntoBytes>(
+//     w: &mut W,
+//     list: &[T],
+// ) -> std::io::Result<usize> {
+//     let mut n = 0;
+
+//     for (i, t) in list.iter().enumerate() {
+//         if i != 0 {
+//             n += Comma.to_string().write_into_bytes(w)?;
+//         }
+
+//         n += t.write_into_bytes(w)?;
+//     }
+
+//     Ok(n)
+// }
 
 fn escape_qdstr<'a>(bytes: &FlatCow<'a, ByteStr>) -> FlatCow<'a, ByteStr> {
     let mut buf = CowBuf::<ByteStr>::from(bytes);

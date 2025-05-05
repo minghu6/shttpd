@@ -4,3 +4,6 @@ bump-verson:
 
 clean-ice:
 	trash rustc-ice-2025*.txt
+
+build:
+	cargo build --all-features

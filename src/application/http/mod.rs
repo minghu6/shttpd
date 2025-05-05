@@ -1,25 +1,26 @@
 use std::{
-    fmt::{Debug, Display},
-    mem::transmute,
-    num::ParseIntError,
-    string::ToString,
+    fmt::{Debug, Display}, mem::transmute, num::ParseIntError, ops::RangeInclusive, string::ToString
 };
 
-use chrono::{DateTime, Datelike, TimeZone, Timelike, Weekday};
+pub use case_insensitive_string::CaseInsensitiveString;
+use chrono::{
+    DateTime, Datelike, NaiveDate, NaiveDateTime, NaiveTime, TimeZone,
+    Timelike, Weekday,
+};
 use derive_more::derive::{Deref, DerefMut};
 pub use m6io::FlatCow;
 use m6io::{ByteStr, ByteString};
 use m6tobytes::{derive_from_bits, derive_to_bits};
-pub use nonempty::NonEmpty;
+use nonempty::NonEmpty;
 use parameters::ContentCoding;
-use strum::{Display, EnumString};
-pub use case_insensitive_string::CaseInsensitiveString;
+use strum::{Display, EnumIter, EnumString, IntoStaticStr};
 use uri::RequestTarget;
+
 use super::{charset, mime};
 
 pub mod parsing;
-pub mod writing;
 pub mod uri;
+pub mod writing;
 
 ////////////////////////////////////////////////////////////////////////////////
 //// Constants
@@ -62,8 +63,9 @@ pub struct CompleteResponse {
     pub body: Body,
 }
 
-#[derive(Debug)]
+#[derive()]
 pub enum Body {
+    Empty,
     Complete(Box<[u8]>),
     Chunked,
 }
@@ -90,6 +92,7 @@ pub struct StatusLine {
 
 /// case-sensitive
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, EnumString, Display)]
+#[strum(serialize_all = "UPPERCASE")]
 pub enum Method {
     Options,
     Get,
@@ -206,67 +209,65 @@ pub enum StatusCode {
 
 #[derive(Debug, Deref, DerefMut)]
 pub struct Fields {
-    pub fields: Vec<Field>,
+    pub values: Vec<Field>,
 }
 
-#[derive(
-    Debug, Clone, PartialEq, Eq, Hash, EnumString, Display,
-)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Display, EnumIter, IntoStaticStr)]
 #[strum(
     ascii_case_insensitive,
     parse_err_fn = to_infalliable,
-    parse_err_ty = Infallible
+    parse_err_ty = Infallible,
+    serialize_all = "Train-Case"
 )]
 pub enum FieldName {
-    #[strum(serialize = "Accept")]
+    Allow,
     Accept,
+    AcceptEncoding,
     Connection,
-    #[strum(serialize = "Content-Type")]
     ContentType,
-    #[strum(serialize = "Content-Encoding")]
     ContentEncoding,
-    #[strum(serialize = "Content-Length")]
     ContentLength,
-    #[strum(serialize = "Date")]
     Date,
-    #[strum(serialize = "Host")]
+    #[strum(serialize = "ETag")]
+    ETag,
+    IfMatch,
+    IfNoneMatch,
+    IfModifiedSince,
+    IfUnmodifiedSince,
+    IfRange,
     Host,
-    #[strum(serialize = "Server")]
     Server,
-    #[strum(serialize = "Transfer-Encoding")]
     TransferEncoding,
-    #[strum(serialize = "Range")]
     Range,
-    #[strum(serialize = "Accept-Ranges")]
     AcceptRanges,
-    #[strum(serialize = "Content-Range")]
     ContentRange,
+    UserAgent,
     #[strum(default)]
     NonStandard(CaseInsensitiveString),
 }
 
-///
-/// ```abnf
-/// Host = uri-host [ ":" port ]
-/// ```
-///
-#[derive(Debug)]
-pub struct Host {
-    pub host: String,
-    pub port: Option<u16>,
-}
-
 #[derive(Debug)]
 pub enum Field {
+    Allow(Allow),
     Accept(Accept),
-    /// Connection: close
+    AcceptEncoding(AcceptEncoding),
     Connection(Connection),
     ContentType(MediaType),
     ContentEncoding(ContentEncoding),
     ContentLength(u64),
     Date(Date),
+    ETag(EntityTag),
     Host(Host),
+    IfMatch(IfMatch),
+    IfNoneMatch(IfMatch),
+    IfModifiedSince(HTTPDate),
+    IfUnmodifiedSince(HTTPDate),
+    IfRange(IfRange),
     Server(Server),
+    Range(RangesSpecifier),
+    AcceptRanges(AcceptRanges),
+    ContentRange(ContentRange),
+    UserAgent(UserAgent),
     TransferEncoding(TransferEncoding),
     NonStandard(RawField),
 }
@@ -282,6 +283,17 @@ pub struct RawField {
 }
 
 ///
+/// ```abnf
+/// Host = uri-host [ ":" port ]
+/// ```
+///
+#[derive(Debug)]
+pub struct Host {
+    pub host: String,
+    pub port: Option<u16>,
+}
+
+///
 /// xx=yy ; mm=nn ...
 ///
 /// ```abnf
@@ -290,18 +302,18 @@ pub struct RawField {
 /// parameter-name  = token
 /// parameter-value = ( token / quoted-string )
 /// ```
-#[derive(Debug, Deref, DerefMut)]
+#[derive(Debug, Deref, DerefMut, Clone)]
 pub struct Parameters {
     value: Vec<Parameter>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Parameter {
     pub name: String,
     pub value: ParameterValue,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub enum ParameterValue {
     Token(String),
     QStr(ByteString),
@@ -317,7 +329,7 @@ pub enum SingletonFieldValue {
 ///
 /// Field `MediaType`
 ///
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MediaType {
     pub mime: mime::MediaType,
     pub parameters: Parameters,
@@ -327,6 +339,11 @@ pub struct MediaType {
 pub struct MediaRange {
     pub mime: mime::MediaRangeType,
     pub parameters: Parameters,
+}
+
+#[derive(Debug, Deref, DerefMut)]
+pub struct Allow {
+    pub values: Vec<Method>,
 }
 
 ///
@@ -342,14 +359,40 @@ pub struct MediaRange {
 ///
 #[derive(Debug, Deref, DerefMut)]
 pub struct Accept {
-    pub values: NonEmpty<(MediaRange, f32)>,
+    pub values: Vec<(MediaRange, Option<f32>)>,
 }
 
 /// deprecated field (for utf-8 has become nearly ubiquitous)
 pub struct AcceptCharset {
-    pub values: NonEmpty<(Charset, f32)>,
+    pub values: Vec<(Charset, Option<f32>)>,
 }
 
+///
+/// Empty Encoding = `Identity`
+///
+/// ```abnf
+/// Accept-Encoding = #( codings [ weight ] )
+/// ```
+///
+#[derive(Debug, Deref, DerefMut)]
+pub struct AcceptEncoding {
+    pub values: Vec<(Codings, Option<f32>)>,
+}
+
+
+///
+/// ```abnf
+/// codings = content-coding / "identity" / "*"
+/// ```
+///
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Codings {
+    Spec(ContentCoding),
+    Identity,
+    Star,
+}
+
+#[derive(Debug, Clone)]
 pub enum Charset {
     Spec(charset::Charset),
     Star,
@@ -361,14 +404,14 @@ pub struct ContentLength {
     pub value: u64,
 }
 
-#[derive(Debug, Deref)]
+#[derive(Debug, Deref, DerefMut)]
 pub struct ContentEncoding {
-    pub value: NonEmpty<ContentCoding>,
+    pub value: Vec<ContentCoding>,
 }
 
 #[derive(Debug, Deref, DerefMut)]
 pub struct Connection {
-    pub value: NonEmpty<ConnectionOption>,
+    pub value: Vec<ConnectionOption>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, EnumString, Display)]
@@ -390,12 +433,11 @@ pub enum ConnectionOption {
 ///
 #[derive(Debug, Deref, DerefMut)]
 pub struct TransferEncoding {
-    pub value: NonEmpty<TransferCoding>,
+    pub value: Vec<TransferCoding>,
 }
 
 ///
-///
-/// ```ABNF
+/// ```abnf
 /// transfer-coding    = token *( OWS ";" OWS transfer-parameter )
 /// transfer-parameter = token BWS "=" BWS ( token / quoted-string )
 /// ```
@@ -414,7 +456,7 @@ pub mod parameters {
     /// ](https://www.iana.org/assignments/http-parameters/http-parameters.xhtml)
     ///
     #[derive(Debug, Clone, Copy, PartialEq, Eq, EnumString, Display)]
-    #[strum(ascii_case_insensitive)]
+    #[strum(ascii_case_insensitive, serialize_all = "snake_case")]
     pub enum ContentCoding {
         /// AES-GCM encryption with a 128-bit content encryption key
         AES128GCM,
@@ -431,8 +473,8 @@ pub mod parameters {
         /// W3C Efficient XML Interchange
         EXI,
         Gzip,
-        /// "no encoding", identity(x) = x
-        Identity,
+        // /// reserved "no encoding", identity(x) = x
+        // Identity,
         /// Network Transfer Format for Java Archives
         #[strum(serialize = "pack200-gzip")]
         Pack200GZip,
@@ -460,6 +502,30 @@ pub mod parameters {
     }
 }
 
+///
+/// ```abnf
+/// chunked-body = *chunk
+///                last-chunk
+///                trailer-section
+///                CRLF
+/// ```
+///
+#[derive(Debug)]
+pub struct ChunkedBody {
+    pub chunks: Vec<Chunk>,
+    pub last_chunk: Chunk,
+    pub trailer_section: Fields,
+}
+
+///
+/// ```abnf
+/// chunk          = chunk-size [ chunk-ext ] CRLF
+///                  chunk-data CRLF
+/// chunk-size     = 1*HEXDIG
+/// last-chunk     = 1*("0") [ chunk-ext ] CRLF
+/// chunk-data     = 1*OCTET ; a sequence of chunk-size octets
+/// ```
+///
 #[derive(Debug)]
 pub struct Chunk {
     pub size: u32,
@@ -482,13 +548,13 @@ pub struct ChunkHeader {
 ///
 #[derive(Debug, Deref, DerefMut)]
 pub struct ChunkExt {
-    value: Vec<ValueOrPair>,
+    value: Vec<ChunkExtUnit>,
 }
 
 #[derive(Debug)]
-pub enum ValueOrPair {
-    Value(String),
-    Pair(Parameter),
+pub struct ChunkExtUnit {
+    pub name: String,
+    pub value: Option<ParameterValue>,
 }
 
 ///
@@ -509,7 +575,7 @@ pub enum ValueOrPair {
 ///
 /// `chrono::TimeZone::with_ymd_and_hms`
 ///
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Date {
     pub day_name: DayName,
     pub month: MonthName,
@@ -517,6 +583,8 @@ pub struct Date {
     pub year: Year,
     pub time_of_day: TimeOfDay,
 }
+
+pub type HTTPDate = Date;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, EnumString, Debug, Display)]
 #[derive_from_bits(u8)]
@@ -531,8 +599,42 @@ pub enum DayName {
     Sun,
 }
 
+#[derive(PartialEq, Eq, PartialOrd, Ord, Clone)]
+/// ```abnf
+/// entity-tag = [ weak ] opaque-tag
+/// weak       = %s"W/"
+/// ```
+pub struct EntityTag {
+    pub is_weak: bool,
+    pub opaque_tag: ByteString,
+}
+
+/////////////////////////////
+//// Preconditions
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// ```
+/// If-Match = "*" / #entity-tag
+/// ```
+///
+pub enum IfMatch {
+    /// This is a way to check for the existence
+    /// of the resource without caring about its
+    /// specific version.
+    Star,
+    List(Vec<EntityTag>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IfRange {
+    Tag(EntityTag),
+    Date(Date),
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash, EnumString, Debug, Display)]
 #[derive_from_bits(u8)]
+#[derive_to_bits(u8)]
 #[repr(u8)]
 pub enum MonthName {
     Jan = 1,
@@ -574,6 +676,74 @@ pub struct TimeOfDay {
     second: u8,
 }
 
+////////////////////////////////////////
+//// Range Requests
+
+#[derive(Debug)]
+pub struct RangesSpecifier {
+    pub unit: RangeUnit,
+    pub set: NonEmpty<RangeSpec>
+}
+
+#[derive(PartialEq, Eq)]
+pub enum RangeSpec {
+    IntRange {
+        start: u64,
+        end: Option<u64>
+    },
+    SuffixRange {
+        end: u64
+    },
+    OtherRange(ByteString)
+}
+
+#[derive(Debug, Display, EnumIter, PartialEq, Eq)]
+#[strum(ascii_case_insensitive, serialize_all = "lowercase")]
+pub enum RangeUnit {
+    Bytes,
+    #[strum(default)]
+    Custom(CaseInsensitiveString),
+}
+
+#[derive(Debug, Deref, DerefMut)]
+pub struct AcceptRanges {
+    value: NonEmpty<RangeUnit>
+}
+
+///
+/// ```abnf
+/// range-resp      = incl-range "/" ( complete-length / "*" )
+/// incl-range      = first-pos "-" last-pos
+/// complete-length = 1*DIGIT
+/// ```
+///
+#[derive(Debug, PartialEq, Eq)]
+pub struct RangeResp {
+    pub range: RangeInclusive<u64>,
+    /// None for unknown
+    pub complete_length: Option<u64>
+}
+
+/// ```abnf
+/// Content-Range     = range-unit SP range_or_unsatisfied
+/// ```
+#[derive(Debug, PartialEq, Eq)]
+pub struct ContentRange {
+    pub unit: RangeUnit,
+    pub range_or_unsatisfied: RangeOrUnsatisfied
+}
+
+/// ```abnf
+/// range_or_unsatisfied = ( range-resp / unsatisfied-range )
+/// unsatisfied-range    = "*/" complete-length
+/// complete-length      = 1*DIGIT
+/// ```
+#[derive(Debug, PartialEq, Eq)]
+pub enum RangeOrUnsatisfied {
+    Range(RangeResp),
+    Unsatisfied(u64)
+}
+
 ///
 /// ```no_main
 /// Server = product *( RWS ( product / comment ) )
@@ -581,6 +751,17 @@ pub struct TimeOfDay {
 ///
 #[derive(Debug, Clone)]
 pub struct Server {
+    pub product: Product,
+    pub rem: Vec<ProductOrComment>,
+}
+
+///
+/// ```no_main
+/// User-Agent = product *( RWS ( product / comment ) )
+/// ```
+///
+#[derive(Debug, Clone)]
+pub struct UserAgent {
     pub product: Product,
     pub rem: Vec<ProductOrComment>,
 }
@@ -611,7 +792,7 @@ impl Response {
     pub fn field(self, filed: Field) -> Self {
         let mut mut_self = self;
 
-        mut_self.fields.fields.push(filed);
+        mut_self.fields.values.push(filed);
 
         mut_self
     }
@@ -640,6 +821,10 @@ impl Request {
     pub fn closed(&self) -> bool {
         self.fields.closed()
     }
+
+    pub fn accept_encoding(&self) -> Option<&AcceptEncoding> {
+        self.fields.accept_encoding()
+    }
 }
 
 impl Message {
@@ -648,6 +833,93 @@ impl Message {
             Self::Request(request) => &mut request.fields,
             Self::Response(response) => &mut response.fields,
         }
+    }
+}
+
+impl Fields {
+    pub fn new() -> Self {
+        Self { values: Vec::new() }
+    }
+}
+
+impl Debug for Body {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => write!(f, "Empty"),
+            Self::Complete(arg0) => f
+                .debug_tuple("Complete")
+                .field(&ByteStr::new(arg0))
+                .finish(),
+            Self::Chunked => write!(f, "Chunked"),
+        }
+    }
+}
+
+impl ChunkedBody {
+    pub fn split_as_chunks(mut value: &ByteStr, limit: usize) -> Self {
+        let mut chunks = Vec::new();
+
+        let last_chunk = loop {
+            let (next, rems) = value.split_at(limit.min(value.len()));
+
+            if !next.is_empty() {
+                chunks.push(next.into());
+            }
+
+            if rems.is_empty() {
+                break rems.into();
+            }
+
+            value = rems;
+        };
+
+        Self {
+            chunks,
+            last_chunk,
+            trailer_section: Fields::new(),
+        }
+    }
+}
+
+impl Chunk {
+    pub fn from_parts(header: ChunkHeader, data: ByteString) -> Self {
+        Self {
+            size: header.size,
+            ext: header.ext,
+            data,
+        }
+    }
+
+    pub fn is_last(&self) -> bool {
+        self.size == 0
+    }
+}
+
+impl From<&ByteStr> for Chunk {
+    fn from(value: &ByteStr) -> Self {
+        Self {
+            size: value.len() as u32,
+            ext: ChunkExt::new(),
+            data: value.into(),
+        }
+    }
+}
+
+impl ChunkHeader {
+    pub fn is_last(&self) -> bool {
+        self.size == 0
+    }
+}
+
+impl ChunkExt {
+    pub fn new() -> Self {
+        Self { value: Vec::new() }
+    }
+}
+
+impl Display for Connection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "close")
     }
 }
 
@@ -663,15 +935,137 @@ impl CompleteResponse {
     }
 }
 
+impl Debug for EntityTag {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.is_weak {
+            write!(f, "W/")?;
+        }
+
+        write!(f, "\"{}\"", self.opaque_tag)
+    }
+}
+
+impl IfMatch {
+    pub fn if_match(&self, tag: &EntityTag) -> bool {
+        match self {
+            IfMatch::Star => true,
+            IfMatch::List(entity_tags) => entity_tags
+                .iter()
+                .find(|&here_tag| here_tag == tag)
+                .is_some(),
+        }
+    }
+
+    pub fn if_none_match(&self, tag: &EntityTag) -> bool {
+        !self.if_match(tag)
+    }
+}
+
+impl Allow {
+    pub fn new() -> Self {
+        Self { values: Vec::new() }
+    }
+
+    pub fn method(mut self, method: Method) -> Self {
+        self.push(method);
+
+        self
+    }
+}
+
+impl AcceptEncoding {
+    pub fn new() -> Self {
+        Self {
+            values: Default::default(),
+        }
+    }
+
+    pub fn accept_coding(
+        mut self,
+        coding: Codings,
+        opt_weight: Option<f32>,
+    ) -> Self {
+        self.push((coding, opt_weight));
+        self
+    }
+
+    ///
+    /// return a sorted by weight (trim weight = 0)
+    ///
+    pub fn priority_codings(&self) -> Vec<(Codings, f32)> {
+        let mut options = self
+            .values
+            .iter()
+            .filter_map(|(coding, q)| {
+                if *q == Some(0.0) {
+                    None
+                }
+                else {
+                    Some((*coding, q.unwrap_or(1.0)))
+                }
+            })
+            .collect::<Vec<_>>();
+
+        // stable sort
+        options.sort_by(|(_, q1), (_, q2)| q1.partial_cmp(q2).unwrap());
+
+        options
+    }
+
+    ///
+    /// weight = 0
+    ///
+    pub fn rejected_codings(&self) -> Vec<Codings> {
+        self.values
+            .iter()
+            .filter_map(
+                |(coding, q)| {
+                    if *q == Some(0.0) { Some(*coding) } else { None }
+                },
+            )
+            .collect::<Vec<_>>()
+    }
+}
+
 impl Connection {
-    pub fn new(opt: ConnectionOption) -> Self {
-        Self{ value: NonEmpty::new(opt) }
+    pub fn new() -> Self {
+        Self { value: Vec::new() }
+    }
+
+    pub fn connection(mut self, opt: ConnectionOption) -> Self {
+        self.push(opt);
+        self
     }
 }
 
 impl ContentEncoding {
-    pub fn from_vec(vec: Vec<ContentCoding>) -> Option<Self> {
-        NonEmpty::from_vec(vec).map(|value| Self {value})
+    pub fn new() -> Self {
+        Self { value: Vec::new() }
+    }
+
+    pub fn content_coding(mut self, coding: ContentCoding) -> Self {
+        self.push(coding);
+        self
+    }
+}
+
+impl Debug for RangeSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::IntRange { start, end } => {
+                write!(f, "{start}-")?;
+
+                if let Some(end) = end {
+                    write!(f, "{end}")?;
+                }
+            },
+            Self::SuffixRange { end } => {
+                write!(f, "-{end}")?;
+            },
+            Self::OtherRange(arg0) => write!(f, "{arg0}")?,
+        }
+
+        Ok(())
     }
 }
 
@@ -731,17 +1125,18 @@ impl StatusCode {
 }
 
 impl Fields {
+    pub fn accept_encoding(&self) -> Option<&AcceptEncoding> {
+        self.iter().find_map(|field| match field {
+            Field::AcceptEncoding(accept_encoding) => Some(accept_encoding),
+            _ => None,
+        })
+    }
+
     pub fn host(&self) -> Option<&Host> {
-        self.fields
-            .iter()
-            .find(|field| matches!(field, Field::Host(..)))
-            .map(|field| {
-                let Field::Host(host) = field
-                else {
-                    unreachable!()
-                };
-                host
-            })
+        self.values.iter().find_map(|field| match field {
+            Field::Host(host) => Some(host),
+            _ => None,
+        })
     }
 
     pub fn trans_encoding(&self) -> Option<&TransferEncoding> {
@@ -766,8 +1161,19 @@ impl Fields {
         })
     }
 
+    pub fn content_type(&self) -> Option<&ContentType> {
+        self.iter().find_map(|field| {
+            if let Field::ContentType(content_type) = field {
+                Some(content_type)
+            }
+            else {
+                None
+            }
+        })
+    }
+
     pub fn connection(&self) -> Option<&Connection> {
-        self.fields.iter().find_map(|field| {
+        self.values.iter().find_map(|field| {
             if let Field::Connection(connection) = field {
                 Some(connection)
             }
@@ -778,14 +1184,47 @@ impl Fields {
     }
 
     pub fn closed(&self) -> bool {
-        self.connection().map(|conn| {
-            conn.iter()
-                .find(|opt| matches!(opt, ConnectionOption::Close))
-        }).flatten().is_some()
+        self.connection()
+            .map(|conn| {
+                conn.iter()
+                    .find(|opt| matches!(opt, ConnectionOption::Close))
+            })
+            .flatten()
+            .is_some()
     }
 
     pub fn contains(&self, name: FieldName) -> bool {
         self.iter().find(|field| field.name() == name).is_some()
+    }
+}
+
+impl From<Server> for UserAgent {
+    fn from(value: Server) -> Self {
+        Self {
+            product: value.product,
+            rem: value.rem,
+        }
+    }
+}
+
+impl From<UserAgent> for Server {
+    fn from(value: UserAgent) -> Self {
+        Self {
+            product: value.product,
+            rem: value.rem,
+        }
+    }
+}
+
+impl Display for Product {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.name)?;
+
+        if let Some(ref version) = self.version {
+            write!(f, "/{version}")?;
+        }
+
+        Ok(())
     }
 }
 
@@ -794,36 +1233,41 @@ impl Parameters {
         Self { value: Vec::new() }
     }
 
-    pub fn parameter(mut self, name: &str, value: ParameterValue) -> Self {
-        self.push(Parameter {
-            name: name.to_owned(),
-            value,
-        });
+    pub fn parameter(mut self, parameter: Parameter) -> Self {
+        self.push(parameter);
 
         self
     }
 }
 
 impl TransferEncoding {
-    /// `chunked` exists in the last
-    pub fn chunked(&self) -> bool {
-        let coding = self.last();
-
-        coding.coding == parameters::TransferCoding::Chunked
-    }
-}
-
-impl ChunkHeader {}
-
-impl ChunkExt {
     pub fn new() -> Self {
         Self { value: Vec::new() }
     }
+
+    pub fn transfer_coding(mut self, coding: TransferCoding) -> Self {
+        self.push(coding);
+
+        self
+    }
+
+    /// `chunked` exists in the last
+    pub fn is_chunked(&self) -> bool {
+        if let Some(coding) = self.last() {
+            coding.coding == parameters::TransferCoding::Chunked
+        }
+        else {
+            false
+        }
+    }
 }
 
-impl Display for Connection {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "close")
+impl TransferCoding {
+    pub fn chunked() -> Self {
+        Self {
+            coding: parameters::TransferCoding::Chunked,
+            parameters: Parameters::new(),
+        }
     }
 }
 
@@ -838,6 +1282,23 @@ impl Date {
             self.year.to_bits(),
             self.time_of_day
         )
+    }
+
+    pub fn naive_date(&self) -> NaiveDate {
+        NaiveDate::from_ymd_opt(
+            self.year.to_bits() as _,
+            self.month.month(),
+            self.day.to_bits() as _,
+        )
+        .unwrap()
+    }
+
+    pub fn naive_time(&self) -> NaiveTime {
+        self.time_of_day.into()
+    }
+
+    pub fn naive_date_time(&self) -> NaiveDateTime {
+        NaiveDateTime::new(self.naive_date(), self.naive_time())
     }
 }
 
@@ -865,6 +1326,14 @@ impl From<Weekday> for DayName {
 impl MonthName {
     fn fetch_from<D: Datelike>(value: &D) -> Self {
         unsafe { Self::from_u8(value.month0() as u8 + 1) }
+    }
+
+    pub fn month(&self) -> u32 {
+        self.to_bits() as _
+    }
+
+    pub fn month0(&self) -> u32 {
+        self.month() - 1
     }
 }
 
@@ -899,6 +1368,17 @@ impl<T: Timelike> From<T> for TimeOfDay {
     }
 }
 
+impl Into<NaiveTime> for TimeOfDay {
+    fn into(self) -> NaiveTime {
+        NaiveTime::from_hms_opt(
+            self.hour as _,
+            self.minute as _,
+            self.second as _,
+        )
+        .unwrap()
+    }
+}
+
 impl Display for TimeOfDay {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{:02}:{:02}:{:02}", self.hour, self.minute, self.second)
@@ -916,9 +1396,21 @@ impl Field {
             Self::ContentEncoding(..) => ContentEncoding,
             Self::ContentLength(..) => ContentLength,
             Self::TransferEncoding(..) => TransferEncoding,
+            Self::Allow(..) => Allow,
             Self::Accept(..) => Accept,
+            Self::AcceptEncoding(..) => AcceptEncoding,
             Self::Server(..) => Server,
             Self::Date(..) => Date,
+            Self::ETag(..) => ETag,
+            Self::IfMatch(..) => IfMatch,
+            Self::IfNoneMatch(..) => IfNoneMatch,
+            Self::IfModifiedSince(..) => IfModifiedSince,
+            Self::IfUnmodifiedSince(..) => IfUnmodifiedSince,
+            Self::IfRange(..) => IfRange,
+            Self::Range(..) => Range,
+            Self::AcceptRanges(..) => AcceptRanges,
+            Self::ContentRange(..)  => ContentRange,
+            Self::UserAgent(..) => UserAgent,
             Self::NonStandard(RawField { name, .. }) => {
                 NonStandard(CaseInsensitiveString::new(name))
             }
@@ -944,7 +1436,6 @@ impl TryFrom<u16> for StatusCode {
         }
     }
 }
-
 
 
 #[cfg(test)]
@@ -1007,5 +1498,12 @@ mod tests {
 
         assert_eq!(b'/'.to_string(), "47");
         assert_eq!(Solidus.as_str(), "/");
+
+        let name = FieldName::NonStandard(CaseInsensitiveString::new("asdd"));
+
+        let name_origin = name.clone();
+        let name_s: &'static str = name.into();
+
+        println!("{name_origin}/{name_s}");
     }
 }

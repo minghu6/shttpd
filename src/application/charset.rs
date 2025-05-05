@@ -10,12 +10,10 @@ use strum::EnumString;
 #[derive(
     Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, EnumString, Display,
 )]
-#[strum(ascii_case_insensitive)]
+#[strum(ascii_case_insensitive, serialize_all = "lowercase")]
 pub enum Charset {
     #[strum(serialize = "utf-8")]
     UTF8 = 106,
-    #[strum(serialize = "gbk")]
     GBK = 113,
-    #[strum(serialize = "gb18030")]
     GB18030 = 114
 }
