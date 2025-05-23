@@ -11,12 +11,8 @@ use log4rs::Config;
 use m6ptr::OnceStatic;
 use serde::Deserialize;
 
-pub static SERV_CONF: OnceStatic<ServConf> = OnceStatic::new();
-
-
 ////////////////////////////////////////////////////////////////////////////////
 //// Constants
-
 
 #[cfg(target_os = "linux")]
 pub const SERVER_NAME: &str = "SHTTPD/0.0.1 (Linux)";
@@ -27,6 +23,10 @@ pub const SERVER_NAME: &str = "SHTTPD/0.0.1 (Windows)";
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
 pub const SERVER_NAME: &str = "SHTTPD/0.0.1 (Other)";
 
+////////////////////////////////////////////////////////////////////////////////
+//// Static Variables
+
+pub static SERV_CONF: OnceStatic<ServConf> = OnceStatic::new();
 
 ////////////////////////////////////////////////////////////////////////////////
 //// Structures
