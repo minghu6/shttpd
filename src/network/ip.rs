@@ -1,8 +1,10 @@
-use std::{mem::transmute, ops::AddAssign};
+use std::{fmt::Debug, mem::transmute, ops::AddAssign};
 
 use m6tobytes::*;
+use strum::{EnumIter, IntoEnumIterator};
 
-use super::IPv4Addr;
+use super::{IPv4Addr, InetCkSum, inet_cksum};
+use crate::be::U16Be;
 
 ////////////////////////////////////////////////////////////////////////////////
 //// Structures
@@ -76,13 +78,14 @@ pub struct ToS(u8);
 #[repr(transparent)]
 pub struct DS(u8);
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 #[derive_to_bits_into(DS)]
 #[derive_to_bits(u8)]
 #[repr(u8)]
 pub enum DSCP {
     /// Default Forwarding (CS0)
     ///
+    #[default]
     DF = 0,
     /// Lower-effort
     LE = 1,
@@ -142,11 +145,12 @@ pub enum DropProb {
 /// ECT0 vs ECT1, reference: https://www.rfc-editor.org/rfc/rfc3168.html#page-55
 ///
 /// (supply one bit nonce)
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 #[derive_to_bits(u8)]
 #[repr(u8)]
 pub enum ECN {
     /// Not ECT-Capable Transport
+    #[default]
     NotECT = 0,
     /// 0b01
     ECT1,
@@ -155,19 +159,17 @@ pub enum ECN {
     /// Congestion Experienced, 0b11
     ///
     /// modify the ECT0 or ETC1 to CE
-    CE
+    CE,
 }
 
 /// Datagram (header + data) length
-#[derive(Clone, Copy, PartialEq, Eq, Hash, FromBytes, ToBytes)]
-#[derive_to_bits(u16)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(transparent)]
-pub struct TotLen(u16);
+pub struct TotLen(U16Be);
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, FromBytes, ToBytes)]
-#[derive_to_bits(u16)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(transparent)]
-pub struct Id(u16);
+pub struct Id(U16Be);
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, FromBytes, ToBytes)]
 #[derive_to_bits(u16)]
@@ -175,42 +177,46 @@ pub struct Id(u16);
 pub struct FlagsAndOff(u16);
 
 /// low 13 bit in units of 8 bytes
-#[derive(Clone, Copy, PartialEq, Eq, Hash, FromBytes, ToBytes)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, FromBytes, ToBytes, Default)]
 #[repr(transparent)]
 pub struct FragOff(u16);
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, EnumIter, Debug, Default)]
 #[derive_to_bits(u8)]
 #[repr(u8)]
 pub enum FragFlag {
     /// Don't Fragment, If the DF flag is set, and fragmentation is required
     /// to route the packet, then the packet is dropped.
+    #[default]
     DF = 0b010,
     /// More Fragments, For unfragmented packets, the MF flag is cleared.
     ///
     /// For fragmented packets, all fragments except the last have the MF flag set.
     /// The last fragment has a non-zero Fragment Offset field, so it can still be
     /// differentiated from an unfragmented packet.
-    MF = 0b001
+    MF = 0b001,
 }
 
 /// Time to lives: hop limit for ip packet
-#[derive(Clone, Copy, PartialEq, Eq, Hash, FromBytes, ToBytes)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, FromBytes, ToBytes, Debug)]
 #[derive_to_bits(u8)]
 #[repr(transparent)]
 pub struct TTL(u8);
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, FromBytes, ToBytes)]
 #[derive_to_bits(u8)]
+#[derive_from_bits(u8)]
 #[repr(transparent)]
 pub struct Protocol(u8);
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+/// Refer [IANA protocol numbers](https://www.iana.org/assignments/protocol-numbers/protocol-numbers.xhtml)
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 #[derive_to_bits_into(Protocol)]
 #[derive_to_bits(u8)]
 #[repr(u8)]
-pub enum ProtocolSpec {
+pub enum ProtocolKind {
     /// 0x00 IPv6 Hop by Hop Options
+    #[default]
     HopOpt,
     /// 0x01 Internet Control Message Protocol
     ICMP,
@@ -570,14 +576,13 @@ pub enum ProtocolSpec {
     /// 0xFD-0xFE 253-254
     Test(u8),
     /// or Raw
-    Reserved = 0xFF
+    Reserved = 0xFF,
 }
 
 ///
 /// IPv4 Diagram Header (20 bytes)
 ///
-#[derive(Clone, Copy, PartialEq, Eq, Hash, FromBytes, ToBytes)]
-#[repr(packed)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 #[repr(C)]
 pub struct IPv4 {
     pub ihl_v: IHLAndVer,
@@ -590,9 +595,9 @@ pub struct IPv4 {
     /// Check: IPv4 header
     ///
     /// While computing the checksum, the checksum field itself is cleared.
-    pub cksum: u16,
+    pub cksum: InetCkSum,
     pub src: IPv4Addr,
-    pub dst: IPv4Addr
+    pub dst: IPv4Addr,
 }
 
 /// IPv4 pseudo header for checksum
@@ -605,7 +610,7 @@ pub struct PseudoHeader {
     pub zeros: u8,
     pub proto: Protocol,
     /// The length of the payload (such as length of TCP/UDP header and data).
-    pub payload_len: u16
+    pub payload_len: u16,
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -621,17 +626,36 @@ impl IPv4 {
             payload_len,
         }
     }
+
+    pub fn checksummed(mut self) -> Self {
+        self.cksum = Default::default();
+        self.cksum = inet_cksum(self.as_buf()).into();
+
+        self
+    }
+
+    pub fn verify_cksum(&self) -> bool {
+        inet_cksum(self.as_buf()) == 0
+    }
+
+    pub fn as_buf(&self) -> &[u8] {
+        as_raw_slice(self)
+    }
 }
 
-impl From<Protocol> for ProtocolSpec {
+impl From<Protocol> for ProtocolKind {
     fn from(value: Protocol) -> Self {
-        let v = value.0;
+        Self::from(value.0)
+    }
+}
 
-        match v {
-            146..=252 => Self::Unassigned(v),
-            253 | 254 => Self::Test(v),
+impl From<u8> for ProtocolKind {
+    fn from(value: u8) -> Self {
+        match value {
+            146..=252 => Self::Unassigned(value),
+            253 | 254 => Self::Test(value),
             255 => Self::Reserved,
-            _ => unsafe { transmute(v as u16) }
+            _ => unsafe { transmute(value as u16) },
         }
     }
 }
@@ -655,9 +679,27 @@ impl FragOff {
     }
 }
 
+impl Debug for FragOff {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.len())
+    }
+}
+
 impl FlagsAndOff {
     pub fn has_flag(&self, flag: FragFlag) -> bool {
         ((self.0 >> 13) as u8 & flag.to_bits()) > 0
+    }
+
+    pub fn flags(&self) -> Vec<FragFlag> {
+        let mut collected = vec![];
+
+        for flag in FragFlag::iter() {
+            if self.has_flag(flag) {
+                collected.push(flag);
+            }
+        }
+
+        collected
     }
 
     pub fn offset(&self) -> FragOff {
@@ -673,6 +715,18 @@ impl FlagsAndOff {
     }
 }
 
+impl Default for FlagsAndOff {
+    fn default() -> Self {
+        Self::new_with_offset(FragOff::default())
+    }
+}
+
+impl Debug for FlagsAndOff {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "(flags={:?}, offset={:?})", self.flags(), self.offset())
+    }
+}
+
 impl AddAssign<FragFlag> for FlagsAndOff {
     fn add_assign(&mut self, rhs: FragFlag) {
         self.add_flag(rhs);
@@ -682,7 +736,7 @@ impl AddAssign<FragFlag> for FlagsAndOff {
 impl TotLen {
     /// Datagram (header + data) length in bytes
     pub fn tot_len(&self) -> usize {
-        self.0 as usize * 4
+        self.0.to_ne() as usize * 4
     }
 
     pub fn data_len(&self) -> usize {
@@ -695,7 +749,13 @@ impl TotLen {
         debug_assert!(tot_len % 4 == 0);
         debug_assert!((tot_len >> 2) <= u16::MAX as usize);
 
-        Self((tot_len >> 2) as u16)
+        Self(U16Be::new((tot_len >> 2) as u16))
+    }
+}
+
+impl Debug for TotLen {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.tot_len())
     }
 }
 
@@ -726,9 +786,7 @@ impl From<DSCP> for ServiceClass {
             DSCP::AF32 => Self::MultimediaStreaming(DropProb::Medium),
             DSCP::AF33 => Self::MultimediaStreaming(DropProb::High),
             DSCP::AF41 => Self::MultimediaConferencing(DropProb::Low),
-            DSCP::AF42 => {
-                Self::MultimediaConferencing(DropProb::Medium)
-            }
+            DSCP::AF42 => Self::MultimediaConferencing(DropProb::Medium),
             DSCP::AF43 => Self::MultimediaConferencing(DropProb::High),
             DSCP::CS2 => Self::OAM,
             DSCP::CS3 => Self::BroadcastVideo,
@@ -756,7 +814,8 @@ impl From<ServiceClass> for DSCP {
             ServiceClass::NetworkControl => Self::CS6,
             ServiceClass::Telephony => Self::EF,
             ServiceClass::Signaling => Self::CS5,
-            ServiceClass::MultimediaConferencing(drop_prob) => match drop_prob {
+            ServiceClass::MultimediaConferencing(drop_prob) => match drop_prob
+            {
                 DropProb::Low => Self::AF41,
                 DropProb::Medium => Self::AF42,
                 DropProb::High => Self::AF43,
@@ -775,15 +834,27 @@ impl From<ServiceClass> for DSCP {
                 44 => Self::VoiceAdmit,
                 8 => Self::CS1,
                 56 => Self::CS7,
-                undefined => Self::Undefined(undefined)
+                undefined => Self::Undefined(undefined),
             },
         }
     }
 }
 
+impl Id {
+    pub fn new(id: u16) -> Self {
+        Self(U16Be::new(id))
+    }
+}
+
+impl Debug for Id {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0.to_ne())
+    }
+}
+
 impl ToS {
-    pub fn ds(&self) -> DS {
-        DS(self.0 >> 2)
+    pub fn ds(&self) -> DSCP {
+        DS(self.0 >> 2).into()
     }
 
     pub fn ecn(&self) -> ECN {
@@ -791,14 +862,32 @@ impl ToS {
     }
 }
 
-impl From<(DS, ECN)> for ToS {
-    fn from(value: (DS, ECN)) -> Self {
+impl From<(DSCP, ECN)> for ToS {
+    fn from(value: (DSCP, ECN)) -> Self {
         let (ds, ecn) = value;
 
         let dscp = ds.to_bits();
         let ecncp = ecn.to_bits();
 
         Self(dscp << 2 | ecncp)
+    }
+}
+
+impl Default for ToS {
+    fn default() -> Self {
+        (DSCP::default(), ECN::default()).into()
+    }
+}
+
+impl Debug for ToS {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "(ds={:?}, ecn={:?})", DSCP::from(self.ds()), self.ecn())
+    }
+}
+
+impl Debug for Protocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", ProtocolKind::from(*self))
     }
 }
 
@@ -815,5 +904,23 @@ impl IHLAndVer {
     pub fn with_ihl_and_ver(ihl: u8, ver: u8) -> Self {
         Self(ihl | (ver << 4))
     }
+
+    pub fn with_options_bytes(nbytes: usize) -> Self {
+        Self::with_ihl_and_ver(
+            ((size_of::<IPv4>() + nbytes) / 4).try_into().unwrap(),
+            4,
+        )
+    }
 }
 
+impl Default for IHLAndVer {
+    fn default() -> Self {
+        Self::with_options_bytes(0)
+    }
+}
+
+impl Debug for IHLAndVer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "(l={}, v={})", self.ihl(), self.ver())
+    }
+}

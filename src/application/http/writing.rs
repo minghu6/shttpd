@@ -1,6 +1,6 @@
 use std::{ascii::Char::*, io::Write};
 
-use m6io::{CowBuf, WriteIntoBytes};
+use m6io::{cow::CowBuf, bstr::WriteIntoBytes};
 
 use super::*;
 

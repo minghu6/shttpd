@@ -1,6 +1,6 @@
 [package]
 name = "osimodel"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 description = ""
 authors = ["minghu6 <a19678zy@163.com>"]
@@ -23,8 +23,10 @@ full = ["parse", "http"]
 
 [dependencies]
 m6tobytes = { path = "../m6coll/m6tobytes" }
-derive_more = { version = "1.0.0", features = ["display", "error", "deref", "deref_mut"] }
+derive_more = { version = "1", features = ["display", "error", "deref", "deref_mut"] }
 strum = { version = "0.27", features = ["derive"] }
+int-enum = "1"
+
 
 # optional http
 cookie = { version = "0.18", optional = true }

@@ -8,8 +8,8 @@ use chrono::{
     Timelike, Weekday,
 };
 use derive_more::derive::{Deref, DerefMut};
-pub use m6io::FlatCow;
-use m6io::{ByteStr, ByteString};
+pub use m6io::cow::FlatCow;
+use m6io::bstr::{ByteStr, ByteString};
 use m6tobytes::{derive_from_bits, derive_to_bits};
 use nonempty::NonEmpty;
 use parameters::ContentCoding;
@@ -1319,13 +1319,13 @@ impl<Tz: TimeZone> From<DateTime<Tz>> for Date {
 
 impl From<Weekday> for DayName {
     fn from(value: Weekday) -> Self {
-        unsafe { Self::from_u8(value.num_days_from_monday() as u8 + 1) }
+        unsafe { Self::from_bits(value.num_days_from_monday() as u8 + 1) }
     }
 }
 
 impl MonthName {
     fn fetch_from<D: Datelike>(value: &D) -> Self {
-        unsafe { Self::from_u8(value.month0() as u8 + 1) }
+        unsafe { Self::from_bits(value.month0() as u8 + 1) }
     }
 
     pub fn month(&self) -> u32 {

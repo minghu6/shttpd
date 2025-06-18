@@ -7,14 +7,11 @@
 #![feature(trivial_bounds)]
 #![feature(impl_trait_in_assoc_type)]
 #![feature(anonymous_lifetime_in_impl_trait)]
+#![feature(ip_as_octets)]
+#![feature(ip_from)]
 
 pub mod datalink;
 pub mod network;
 pub mod transport;
 pub mod application;
-
-
-#[cfg(test)]
-mod tests {
-
-}
+pub mod be;

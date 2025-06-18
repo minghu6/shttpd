@@ -4,7 +4,7 @@
 //!
 //! 1. [rfc-7230](https://datatracker.ietf.org/doc/html/rfc7230)
 
-use std::convert::Infallible;
+use std::{convert::Infallible};
 
 use m6io::{
     ALPHA, DIGIT,
@@ -115,7 +115,7 @@ pub struct Authority {
 ///
 #[derive(EnumString, Display, Clone, Debug)]
 #[strum(
-    ascii_case_insensitive,
+    ascii_case_insensitive, serialize_all = "lowercase",
     parse_err_fn = to_infalliable,
     parse_err_ty = Infallible
 )]
@@ -173,7 +173,6 @@ pub struct URI {
     pub query: Option<String>,
     pub fragment: Option<String>,
 }
-
 
 ////////////////////////////////////////////////////////////////////////////////
 //// Implementations
@@ -937,7 +936,7 @@ pub(crate) fn to_infalliable(_s: &str) -> Infallible {
 mod tests {
     use std::str::FromStr;
 
-    use m6io::{ByteStr, bstr};
+    use m6io::{bstr::ByteStr, bstr};
     use nom::{
         Err,
         error::{Error, ErrorKind::*},
@@ -996,6 +995,15 @@ mod tests {
         println!("{:#?}", request_target("/").unwrap());
 
         println!("{:#?}", request_target("/../../").unwrap());
+
+    }
+
+    #[test]
+    fn test_host() {
+        use std::net::Ipv6Addr;
+
+        let ip = Ipv6Addr::from_str("::ffff:192.0.2.1").unwrap();
+        println!("{ip:?}");
 
     }
 }

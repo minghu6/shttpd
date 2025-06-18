@@ -15,7 +15,9 @@ use std::{
 };
 
 use m6io::{
-    ALPHA, ByteStr, ConsumeByteStr, DIGIT, FlatCow, FromByteStr, WS,
+    ALPHA, DIGIT, WS,
+    bstr::{ByteStr, ConsumeByteStr, FromByteStr},
+    cow::FlatCow,
     nom::{
         AsByte,
         byte::{
@@ -2546,7 +2548,7 @@ fn fold_map_res_field_list<'a, T, C, E2>(
 
 #[cfg(test)]
 mod tests {
-    use m6io::{ToByteString, bstr};
+    use m6io::{bstr::ToByteString, bstr};
 
     use super::*;
 
