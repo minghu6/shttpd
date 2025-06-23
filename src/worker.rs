@@ -6,7 +6,7 @@ use std::{
 
 use futures::executor::ThreadPool;
 use log::{error, trace, warn};
-use m6io::{ByteStr, WriteIntoBytes};
+use m6io::{bstr::{ WriteIntoBytes, ByteStr}};
 use osimodel::application::http::{
     Body, Chunk, ChunkHeader, CompleteRequest, CompleteResponse, Fields, Request, Response, StartLine
 };

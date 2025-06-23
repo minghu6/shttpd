@@ -5,7 +5,7 @@ use std::{
 
 use chrono::{DateTime, Local};
 use log::info;
-use m6io::ByteString;
+use m6io::bstr::ByteString;
 use osimodel::application::{
     http::{
         Allow, Body, Chunk, ChunkedBody, Codings, CompleteRequest,

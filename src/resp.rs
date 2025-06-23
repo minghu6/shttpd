@@ -1,5 +1,5 @@
 use chrono::Local;
-use m6io::ByteStr;
+use m6io::bstr::ByteStr;
 use osimodel::application::http::{
     Body::{ Complete, Chunked }, CompleteResponse, Connection, ConnectionOption, Field, FieldName, Fields, Response, Server, StatusCode::{self, *}, TransferCoding, TransferEncoding, Version
 };
